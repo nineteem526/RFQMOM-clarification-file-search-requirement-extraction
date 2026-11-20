@@ -1,0 +1,81 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  streamlit-demo:
+    name: Streamlit demo tests (Python ${{ matrix.python }})
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+          cache-dependency-path: requirements.txt
+      - run: python -m pip install -r requirements.txt
+      - run: python -B -m unittest discover -s tests -v
+
+  kotaemon-logic:
+    # Only modules that do not need the provisioned Kotaemon runtime, models or NLTK data.
+    # The full suite must still be run locally in the dedicated runtime (see kotaemon-source/README.md).
+    name: Kotaemon pure-logic tests
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Run runtime-independent tests
+        working-directory: kotaemon-source/tests
+        env:
+          PYTHONPATH: ..
+        run: >-
+          python -B -m unittest -v
+          test_company_probe
+          test_appservice_configuration
+          test_file_lock
+          test_network_access
+          test_office_convert
+          test_pipeline_fingerprint
+          test_project_registry
+          test_runtime_paths
+          test_scan_sources
+          test_stage_appservice
+          test_synthetic_response
+
+  kotaemon-linux-logic:
+    name: Kotaemon Linux compatibility tests
+    if: vars.RFQ_GITHUB_HOSTED_BUILD_APPROVED == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Check Linux runtime-independent paths and deployment gates
+        working-directory: kotaemon-source/tests
+        env:
+          PYTHONPATH: ..
+        run: >-
+          python -B -m unittest -v
+          test_appservice_configuration
+          test_file_lock
+          test_network_access
+          test_office_convert
+          test_pipeline_fingerprint
+          test_runtime_paths
+          test_stage_appservice
+      - name: Check deployment commands without Azure access
+        run: bash kotaemon-source/tests/test_deploy_appservice.sh

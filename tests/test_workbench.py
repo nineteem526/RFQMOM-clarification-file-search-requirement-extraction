@@ -12,7 +12,8 @@ from openai import AzureOpenAI
 from samples import SAMPLES
 from workbench import (
     MAX_CONTEXT_CHARS, Store, WorkbenchError, completion_text,
-    connection_test, context_payload, extract, make_client, split_text,
+    connection_test, context_payload, default_database, extract, make_client,
+    split_text,
     validate_endpoint, validate_result,
 )
 
@@ -277,3 +278,21 @@ class ApiTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DefaultDatabaseTests(unittest.TestCase):
+    def test_override_takes_precedence(self):
+        with patch.dict("os.environ", {"RFQ_WORKBENCH_DB": "/tmp/x/demo.sqlite3",
+                                       "LOCALAPPDATA": "/tmp/local"}):
+            self.assertEqual(default_database(), Path("/tmp/x/demo.sqlite3"))
+
+    def test_localappdata_default(self):
+        with patch.dict("os.environ", {"LOCALAPPDATA": "/tmp/local"}, clear=True):
+            self.assertEqual(
+                default_database(), Path("/tmp/local") / "RFQWorkbench" / "demo.sqlite3"
+            )
+
+    def test_missing_location_is_rejected(self):
+        with patch.dict("os.environ", {}, clear=True):
+            with self.assertRaises(WorkbenchError):
+                default_database()

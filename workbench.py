@@ -34,10 +34,18 @@ class Evidence:
     score: int = 0
 
 
+DATABASE_ENV = "RFQ_WORKBENCH_DB"
+
+
 def default_database() -> Path:
+    configured = os.environ.get(DATABASE_ENV, "").strip()
+    if configured:
+        return Path(configured)
     base = os.environ.get("LOCALAPPDATA")
     if not base:
-        raise WorkbenchError("缺少 LOCALAPPDATA；请在 Windows 用户环境中启动工具。")
+        raise WorkbenchError(
+            f"缺少 LOCALAPPDATA；请在 Windows 用户环境中启动工具，或设置 {DATABASE_ENV}。"
+        )
     return Path(base) / "RFQWorkbench" / "demo.sqlite3"
 
 

@@ -1,0 +1,109 @@
+name: RFQ App Service
+
+on:
+  push:
+    paths:
+      - "kotaemon-source/**"
+      - ".gitattributes"
+      - ".github/workflows/rfq-appservice.yml"
+  workflow_dispatch:
+    inputs:
+      approve_build:
+        description: "Company approved GitHub-hosted build and BGE/NLTK/tiktoken resources"
+        required: true
+        type: boolean
+        default: false
+      deploy_to_azure:
+        description: "Deploy to the configured test Web App after the container checks"
+        required: true
+        type: boolean
+        default: false
+      deployment_prepared:
+        description: "Test subscription, approved users, source mount and single-instance settings are ready"
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rfq-appservice-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  request-check:
+    name: Validate the requested operation
+    if: github.event_name != 'push' || vars.RFQ_GITHUB_HOSTED_BUILD_APPROVED == 'true'
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Require explicit approvals
+        env:
+          APPROVE_BUILD: ${{ inputs.approve_build }}
+          DEPLOY_TO_AZURE: ${{ inputs.deploy_to_azure }}
+          DEPLOYMENT_PREPARED: ${{ inputs.deployment_prepared }}
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+            if [ "$APPROVE_BUILD" != "true" ]; then
+              echo "::error::Approve use of the GitHub-hosted runner and BGE/NLTK/tiktoken resources before building."
+              exit 1
+            fi
+            if [ "$DEPLOY_TO_AZURE" = "true" ] && [ "$DEPLOYMENT_PREPARED" != "true" ]; then
+              echo "::error::Complete the test subscription, authorized users, source mount, and single-instance setup before deploying."
+              exit 1
+            fi
+            if [ "$DEPLOY_TO_AZURE" = "true" ] && [ "$GITHUB_REF" != "refs/heads/main" ]; then
+              echo "::error::Deployments are restricted to the main branch."
+              exit 1
+            fi
+          fi
+
+  build:
+    name: Build and verify the Linux container
+    needs: request-check
+    if: >-
+      (github.event_name == 'push' && vars.RFQ_GITHUB_HOSTED_BUILD_APPROVED == 'true')
+      || (github.event_name == 'workflow_dispatch' && inputs.approve_build && !inputs.deploy_to_azure)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Build and test with synthetic fixtures
+        run: bash kotaemon-source/environment-setup/ci-build-and-smoke.sh
+
+  deploy:
+    name: Build, verify and deploy the test Web App
+    needs: request-check
+    if: >-
+      github.event_name == 'workflow_dispatch' && inputs.approve_build
+      && inputs.deploy_to_azure && inputs.deployment_prepared
+    runs-on: ubuntu-latest
+    environment: azure-poc
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Build and test with synthetic fixtures
+        run: bash kotaemon-source/environment-setup/ci-build-and-smoke.sh
+      - name: Sign in to Azure with OIDC
+        uses: azure/login@8c334a195cbb38e46038007b304988d888bf676a
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      - name: Verify the Web App and deploy its image
+        env:
+          AZURE_CORE_OUTPUT: none
+          AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          AZURE_RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}
+          AZURE_WEBAPP_NAME: ${{ vars.AZURE_WEBAPP_NAME }}
+          AZURE_ACR_NAME: ${{ vars.AZURE_ACR_NAME }}
+          AZURE_ACR_RESOURCE_GROUP: ${{ vars.AZURE_ACR_RESOURCE_GROUP }}
+        run: bash kotaemon-source/environment-setup/deploy_appservice.sh

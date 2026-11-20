@@ -1,0 +1,2 @@
+kotaemon-source/*.sh text eol=lf
+kotaemon-source/**/*.sh text eol=lf

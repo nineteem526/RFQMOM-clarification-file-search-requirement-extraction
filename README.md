@@ -1,20 +1,81 @@
 # RFQMOM澄清文件检索与要求提取
 
-## 项目概述
+[![CI](https://github.com/nineteem526/RFQMOM-clarification-file-search-requirement-extraction/actions/workflows/ci.yml/badge.svg)](https://github.com/nineteem526/RFQMOM-clarification-file-search-requirement-extraction/actions/workflows/ci.yml)
 
-这是一个面向工程采购文件的 Windows 本地网页原型：把 RFQ、B12、澄清文件及 TE / DF MOM 的描述按关键词汇总，辅助查找要求、差异和待确认事项，并可将用户选中的片段交给企业 AI 接口生成带逐字出处的审核草稿。
+面向工程采购文件（RFQ、B12、澄清文件、TE / DF MOM）的 Windows 本地工具：检索要求、比对差异、整理待确认事项，并通过公司内部 AI 接口生成**带逐字出处**的审核草稿。所有 AI 结果都是草稿，须人工审核，不构成工程批准或标准合规结论。
 
-本仓库只包含根目录的 Streamlit 虚构示例工具。旁边的 `kotaemon-pilot` 是独立实现，不属于本仓库范围；`评审后` 目录包含真实业务资料，明确不纳入版本控制或上传。
+## 仓库组成
 
-## 功能组成
+| 目录 | 定位 | 状态 | 说明 |
+|---|---|---|---|
+| [`kotaemon-source/`](kotaemon-source/README.md) | **工程知识问答助手（主线）** | 本机和 Azure 单实例试点 | 基于 Kotaemon 0.12.0：多格式解析、本地向量检索、带引用回答、后台查询、备份恢复。运行环境需单独准备。 |
+| 根目录（`app.py` 等） | Streamlit 虚构示例（早期原型） | 演示，仅内置虚构 TXT | 轻量展示“检索 → 选片段 → AI 提取 → 逐字引用校验”流程，依赖仅 Streamlit 和 OpenAI SDK。 |
+
+新功能请在 `kotaemon-source` 中开发；根目录示例保留用于演示和回归，不扩展到真实数据。
+
+```text
+.
+├── app.py / workbench.py / samples.py   Streamlit 示例：页面、索引与 API 校验、虚构样例
+├── tests/                               示例的自动化测试
+├── start.ps1                            示例启动脚本
+├── kotaemon-source/                     工程知识问答助手源码快照
+│   ├── project_app.py                   界面与本机 HTTP 服务（Gradio + FastAPI）
+│   ├── project_workspace.py             项目存储、录入、检索与快照
+│   ├── company_chat.py / network_access.py  公司 API 适配与访问边界
+│   ├── environment-setup/               依赖约束与模型哈希清单
+│   └── tests/                           离线回归测试
+├── .github/workflows/ci.yml             持续集成
+└── LICENSE                              授权占位（保留所有权利）
+```
+
+## 快速开始
+
+- **Streamlit 示例**：见下文[组件一](#组件一streamlit-虚构示例)，Python 3.11+，`pip install -r requirements.txt` 后运行 `start.ps1`；Linux 可设置 `RFQ_WORKBENCH_DB` 后运行 `python -m streamlit run app.py`。
+- **工程知识问答助手**：见 [`kotaemon-source/README.md`](kotaemon-source/README.md)。需要已批准的专用运行环境、模型文件和公司端点配置，克隆仓库本身不能直接运行。
+- **Azure App Service 测试部署**：见 [`kotaemon-source/README.md` 的 Python 代码部署指南](kotaemon-source/README.md#azure-app-service-python-代码部署)；不同环境的访问边界和部署结果须分别验证。
+
+## 配置（环境变量）
+
+| 变量 | 组件 | 用途 |
+|---|---|---|
+| `DUERR_API_KEY` | 两者 | 公司 API 密钥，仅从进程环境读取，不写入文件 |
+| `DUERR_API_ENDPOINT` | 两者 | 公司 HTTPS 基础端点 |
+| `DUERR_API_ALLOWED_HOST` | 示例 | 允许访问的端点主机名 |
+| `DUERR_API_APPROVED_ENDPOINT` | 助手 | 管理员批准的端点（白名单） |
+| `DUERR_API_VERSION` / `DUERR_MODEL` | 两者 | API 版本与部署名，默认 `2025-04-01-preview` / `gpt-5.2` |
+| `RFQ_WORKBENCH_DB` | 示例 | 演示数据库路径，默认 `%LOCALAPPDATA%\RFQWorkbench\demo.sqlite3` |
+| `RFQ_AUTHORIZED_SOURCE` | 助手 | 授权资料目录，默认仓库同级的 `评审后`；修改属于授权变更，已有项目仍绑定原目录 |
+
+源码默认不提供公司端点或密钥；运行时应通过环境变量或安全存储配置。
+
+## 持续集成
+
+GitHub Actions 在 Windows 上运行：
+
+- 根目录示例全部测试（Python 3.11 / 3.12）；
+- `kotaemon-source` 中不依赖 Kotaemon 运行时、模型和 NLTK 资源的纯逻辑测试（API 探测、网络边界、Office 转换、资料扫描、授权目录、合成响应校验）。
+
+其余 Kotaemon 测试需要专用运行环境，CI 无法覆盖，修改相关模块后须在本机按 [`kotaemon-source/README.md`](kotaemon-source/README.md#offline-regression-tests) 运行完整测试。CI 不访问公司 API，也不读取业务文件。
+
+## 授权
+
+见 [`LICENSE`](LICENSE)。目前为“保留所有权利”占位，正式授权条款待权利人确定。
+
+---
+
+## 组件一：Streamlit 虚构示例
+
+把 RFQ、B12、澄清文件及 TE / DF MOM 的描述按关键词汇总，辅助查找要求、差异和待确认事项，并可将用户选中的片段交给企业 AI 接口生成带逐字出处的审核草稿。`kotaemon-pilot` 是本机安装目录，`评审后` 是真实业务资料目录，两者均不纳入版本控制。
+
+### 功能组成
 
 - **本地检索**：SQLite 保存文档版本和原文片段；关键词、任意词命中、内置术语扩展及 RFQ / TE / DF 阶段筛选。
 - **版本留存**：同一版本幂等录入，冲突内容拒绝覆盖；各文件版本并列保留，不以日期推断优先级。
 - **证据约束的 AI 草稿**：发送前展示完整请求内容并要求用户确认；只允许配置的企业 HTTPS 主机；AI 输出须为 JSON，来源 ID 和引文通过逐字校验后才显示。
 - **结果导出**：草稿连同原始出处及局限性导出为 JSON；源示例也可打包下载。
-- **本地优先**：页面仅监听 `127.0.0.1`，演示索引写入 `%LOCALAPPDATA%\RFQWorkbench\demo.sqlite3`，不存放在项目目录。
+- **本地优先**：页面仅监听 `127.0.0.1`，演示索引写入 `%LOCALAPPDATA%\RFQWorkbench\demo.sqlite3`（可用 `RFQ_WORKBENCH_DB` 覆盖），不存放在项目目录。
 
-## 技术结构
+### 技术结构
 
 | 文件 | 职责 |
 |---|---|
@@ -24,7 +85,7 @@
 | `tests/` | 存储、检索、API 请求校验和页面流程自动化测试 |
 | `start.ps1` | Windows 本机启动入口 |
 
-## 当前边界
+### 当前边界
 
 - **只接受程序内置的虚构 TXT 示例。真实文件导入和发送禁用。**没有 PDF、扫描件 OCR、Word、Excel 或 PowerPoint 解析。
 - 检索在本地完成：关键词、空格分隔多词的任一匹配、内置术语扩展。不是自然语言语义检索；术语扩展可能带来不相关结果。
@@ -36,7 +97,7 @@
 - 这是单用户演示，不具备生产项目隔离、多用户权限、审批流或正式审计能力。
 - 本仓库不包含真实客户资料、项目文档、模型/解析运行时、向量库或本机安装环境。
 
-## 安装与启动
+### 安装与启动
 
 需要 Windows、Python 3.11 或更新版本。依赖只包含 Streamlit 和 OpenAI Python SDK。
 在本目录 PowerShell 执行：
@@ -56,7 +117,7 @@ python -m venv .venv
 浏览器打开 `http://127.0.0.1:8501`。服务器仅监听本机，不应改为公网监听。终端按 Ctrl+C 停止。
 网页不加载外部字体、脚本或标准检索服务；Streamlit 用量遥测在启动参数中关闭。
 
-## 内部 API
+### 内部 API
 
 按公司正式接入指南，在**启动程序的同一终端**配置：
 
@@ -72,7 +133,7 @@ python -m venv .venv
 输出不完整、无内容、拒答或 JSON/引用校验失败会显示错误，不保存为成功结果。
 HTTP 错误仅显示状态码和请求 ID，不显示可能包含请求内容的原始错误响应。
 
-## 示例流程与预期结果
+### 示例流程与预期结果
 
 1. 点击“录入 RFQ / B12 / 澄清示例”，得到三个文件版本；再次点击新增数为零。
 2. 检索“钢构”：应命中 RFQ 的平台荷载 / 结构计算书、B12 的维修平台荷载，以及澄清文件的供货边界 / 荷载待确认描述。
@@ -82,10 +143,10 @@ HTTP 错误仅显示状态码和请求 ID，不显示可能包含请求内容的
 6. 下载 JSON 结果，包含查询、要求草稿、完整出处及局限性，便于人工复核。AI 的具体条目数量并非固定。
 
 源文件可通过左侧下载 ZIP 查看；不修改业务文件，也不执行 Excel 自动化。
-演示索引存储在 `%LOCALAPPDATA%\RFQWorkbench\demo.sqlite3`，不放入当前 OneDrive 工作目录。
+演示索引存储在 `%LOCALAPPDATA%\RFQWorkbench\demo.sqlite3`，不放入当前 OneDrive 工作目录。非 Windows 环境或需要隔离时，可设置 `RFQ_WORKBENCH_DB` 指定数据库文件完整路径。
 索引跨重启保留；AI 结果仅保存在当前页面会话，长期保留需显式下载。
 
-## 本地验证
+### 本地验证
 
 ```powershell
 .\.venv\Scripts\python.exe -m unittest discover -s tests -v
@@ -94,11 +155,11 @@ HTTP 错误仅显示状态码和请求 ID，不显示可能包含请求内容的
 自动测试使用临时数据库和伪造 API 响应，不发送网络请求、不读取业务文件。
 真实服务的连通性、当前部署及语义质量需在公司网络中使用虚构示例单独验证。
 
-## 仓库范围与安全
+### 仓库范围与安全
 
-Git 忽略规则排除了 `评审后`、`kotaemon-pilot`、本机环境、日志、数据库、密钥文件及常见业务文档格式。提交前仍应检查待提交文件清单；忽略规则不能替代人工审查。
+Git 忽略规则排除了 `评审后`、`kotaemon-pilot`、本机环境、日志、数据库、密钥文件及常见业务文档格式。`kotaemon-source` 只保存经整理的程序源码、测试和必要配置模板，不包含业务数据或公司端点。提交前仍应检查待提交文件清单；忽略规则不能替代人工审查。
 
-## 转为真实项目工具前
+### 转为真实项目工具前
 
 必须确认客户端及业务数据用途获准、支持的文件格式、项目访问范围、存储与保留策略，以及客户文件的替代/优先级规则。
 届时增加真实解析、项目隔离、原文件校验与精确页码/条款定位；扫描件需 OCR 质量提示。
