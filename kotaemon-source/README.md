@@ -2,6 +2,17 @@
 
 ## 本机多项目工作台
 
+### 硅基流动 DeepSeek 个人测试
+
+PowerShell 7 中设置以下进程环境变量，模型名以硅基流动平台当前显示的完整名称为准。密钥仅在本终端进程及其子进程中使用，不要写入仓库或发送到聊天中。
+
+    $env:RFQ_LLM_PROVIDER = "siliconflow"
+    $env:SILICONFLOW_MODEL = "填写平台提供的 DeepSeek 模型完整名称"
+    $env:SILICONFLOW_API_KEY = Read-Host "输入硅基流动 API Key" -MaskInput
+    & "$env:LOCALAPPDATA\RFQKotaemon\runtime\.venv\Scripts\python.exe" -B .\web_app.py --port 7867
+
+打开测试项目的设置并启用“在线模型问答”。当前问题和最多五条检索片段将发往硅基流动，先使用公开测试手册。设置显示“已配置”只代表参数就绪，实际连通性须用测试问题验证。若调用失败或答案未通过引文校验，页面会提示并显示本地原文摘录。关闭终端后环境变量不会保留。
+
 在本文所述的专用 Python 环境准备完成后，从此目录运行：
 
     & "$env:LOCALAPPDATA\RFQKotaemon\runtime\.venv\Scripts\python.exe" -B .\web_app.py --port 7866

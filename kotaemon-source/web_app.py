@@ -681,7 +681,7 @@ class ProjectStore:
         with self._conn() as conn:
             current_revision = conn.execute("SELECT value FROM settings WHERE key='_revision'").fetchone()[0]
             if int(current_revision) == rev and (
-                not llm["configured"] or str(answer_payload.get("llm_provider", "")).startswith("企业模型（")
+                not llm["configured"] or str(answer_payload.get("llm_provider", "")).startswith(("企业模型（", "硅基流动（"))
             ):
                 conn.execute(
                     "INSERT OR REPLACE INTO query_cache(cache_key, revision, payload_json, created_at) VALUES (?, ?, ?, ?)",

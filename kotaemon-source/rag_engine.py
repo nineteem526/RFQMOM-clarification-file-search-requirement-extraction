@@ -241,6 +241,25 @@ def embedding_health() -> dict[str, Any]:
 
 def llm_config_status() -> dict[str, Any]:
     """Only the explicitly approved endpoint may receive source documents."""
+    provider = os.environ.get("RFQ_LLM_PROVIDER", "company-azure").strip().lower()
+    if provider == "siliconflow":
+        key = os.environ.get("SILICONFLOW_API_KEY", "")
+        model = os.environ.get("SILICONFLOW_MODEL", "").strip()
+        if key and key == key.strip() and key.isascii() and re.fullmatch(r"[A-Za-z0-9._/-]+", model):
+            return {
+                "configured": True, "provider": "siliconflow", "model": model,
+                "cache_identity": ("siliconflow", "https://api.siliconflow.cn/v1", model),
+                "status_text": f"硅基流动已配置（{model}）",
+            }
+        return {
+            "configured": False, "provider": "siliconflow", "model": model,
+            "status_text": "硅基流动配置未就绪，请检查模型名和 API Key",
+        }
+    if provider != "company-azure":
+        return {
+            "configured": False, "provider": provider, "model": "",
+            "status_text": "模型服务配置无效",
+        }
     from check_company_api import ENDPOINT
     from company_chat import CompanyChatError, company_config
 
@@ -585,7 +604,7 @@ def verify_grounded_answer(answer_payload: dict[str, Any], citations: list[dict[
 
 
 def _call_external_llm(question: str, citations: list[dict[str, Any]], project_name: str) -> dict[str, Any] | None:
-    """Send project evidence only through the approved company adapter."""
+    """Send evidence through the explicitly selected provider."""
     cfg = llm_config_status()
     if not cfg["configured"]:
         return None
@@ -605,15 +624,36 @@ def _call_external_llm(question: str, citations: list[dict[str, Any]], project_n
     )
     user_prompt = f"项目：{project_name}\n问题：{question}\n\n检索到的原文证据：\n{evidence_block}"
     try:
-        from company_chat import CompanyAzureChat
-        from kotaemon.base import HumanMessage, SystemMessage
+        if cfg["provider"] == "siliconflow":
+            import httpx
+            from openai import OpenAI
 
-        resp = CompanyAzureChat(completion_budget=2048).invoke([
-            SystemMessage(content=system_prompt), HumanMessage(content=user_prompt),
-        ])
-        parsed = json.loads(resp.text)
+            with httpx.Client(follow_redirects=False, timeout=45.0) as http_client:
+                client = OpenAI(api_key=os.environ["SILICONFLOW_API_KEY"],
+                                base_url="https://api.siliconflow.cn/v1",
+                                http_client=http_client, max_retries=0)
+                response = client.chat.completions.create(
+                    model=cfg["model"],
+                    messages=[{"role": "system", "content": system_prompt},
+                              {"role": "user", "content": user_prompt}],
+                    temperature=0.1, max_tokens=2048,
+                    response_format={"type": "json_object"},
+                )
+                if len(response.choices) != 1 or response.choices[0].finish_reason != "stop":
+                    return None
+                raw = response.choices[0].message.content or ""
+        else:
+            from company_chat import CompanyAzureChat
+            from kotaemon.base import HumanMessage, SystemMessage
+
+            resp = CompanyAzureChat(completion_budget=2048).invoke([
+                SystemMessage(content=system_prompt), HumanMessage(content=user_prompt),
+            ])
+            raw = resp.text
+        parsed = json.loads(raw)
         if isinstance(parsed, dict) and isinstance(parsed.get("conclusion"), str):
-            parsed["llm_provider"] = f"企业模型（{cfg['model']}）"
+            label = "硅基流动" if cfg["provider"] == "siliconflow" else "企业模型"
+            parsed["llm_provider"] = f"{label}（{cfg['model']}）"
             return parsed
     except Exception:
         return None
@@ -768,7 +808,8 @@ def generate_structured_answer(
         "passed": bool(selected_quotes),
         "citation_count": len({c["index"] for _, c in selected_quotes}),
         "conflicts": verify_grounded_answer(payload, citations)["conflicts"],
-        "warnings": ["企业模型回答未通过证据校验，已显示原文。"] if llm_out else [],
+        "warnings": (["在线模型回答未通过证据校验，已显示原文。"] if llm_out else
+                     ["在线模型调用未成功，已显示本地原文。"] if allow_external else []),
     }
     conflict_str = "；".join(ver["conflicts"]) if ver["conflicts"] else "未检出明显多版本数值冲突"
     payload["table"] = [
