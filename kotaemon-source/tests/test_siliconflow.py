@@ -5,7 +5,6 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import rag_engine
-from web_app import ProjectStore
 
 
 class SiliconFlowTests(unittest.TestCase):
@@ -13,7 +12,7 @@ class SiliconFlowTests(unittest.TestCase):
         patcher = patch.dict(os.environ, {
             "RFQ_LLM_PROVIDER": "siliconflow",
             "SILICONFLOW_API_KEY": "test-key",
-            "SILICONFLOW_MODEL": "deepseek-ai/DeepSeek-V3",
+            "SILICONFLOW_MODEL": "deepseek-ai/DeepSeek-V4.1-Flash",
         }, clear=True)
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -22,25 +21,91 @@ class SiliconFlowTests(unittest.TestCase):
         status = rag_engine.llm_config_status()
         self.assertTrue(status["configured"])
         self.assertEqual(status["provider"], "siliconflow")
-        self.assertEqual(status["cache_identity"][-1], "deepseek-ai/DeepSeek-V3")
+        self.assertEqual(status["cache_identity"][-1], "deepseek-ai/DeepSeek-V4.1-Flash")
         os.environ["SILICONFLOW_MODEL"] = ""
         self.assertFalse(rag_engine.llm_config_status()["configured"])
 
-    def test_request_and_verified_answer(self):
-        hits = [{"id": "1", "doc_id": "1", "doc_name": "x.pdf", "page": 1,
-                 "content": "Rated voltage: 18 V DC", "semantic_score": 0.9}]
-        result = {"conclusion": "额定电压为 18 V DC [1]", "basis": [], "table": []}
-        response = SimpleNamespace(choices=[SimpleNamespace(finish_reason="stop",
-                                    message=SimpleNamespace(content=json.dumps(result)))])
+    def test_request_and_verified_answer_with_markdown_json_fence(self):
+        hits = [{"id": "1", "doc_id": "1", "doc_name": "makita.pdf", "page": 2,
+                 "content": "Model: XFD12\nRated voltage: D.C. 18 V", "semantic_score": 0.9}]
+        fenced = "```json\n" + json.dumps({
+            "conclusion": "1. XFD12 额定电压为 18V DC，详见第 2 页 [1]。请核对原文。",
+            "basis": [{"index": 1, "source": "makita.pdf", "detail": "原文标注 D.C. 18 V"}],
+            "table": [{"item": "额定电压", "value": "18 V [1]"}],
+        }, ensure_ascii=False) + "\n```"
+        usage = SimpleNamespace(prompt_tokens=120, completion_tokens=45, total_tokens=165)
+        response = SimpleNamespace(
+            choices=[SimpleNamespace(finish_reason="stop", message=SimpleNamespace(content=fenced))],
+            usage=usage,
+        )
         with patch("openai.OpenAI") as client:
             client.return_value.chat.completions.create.return_value = response
             answer = rag_engine.generate_structured_answer("电压是多少", hits, "test", {}, allow_external=True)
-        self.assertTrue(answer["verification"]["passed"])
+        self.assertTrue(answer["verification"]["passed"], answer["verification"]["warnings"])
+        self.assertEqual(answer["answer_status"], "llm_success")
         self.assertTrue(answer["llm_provider"].startswith("硅基流动"))
+        self.assertEqual(answer["llm_stats"]["api_calls"], 1)
+        self.assertEqual(answer["llm_stats"]["total_tokens"], 165)
         self.assertEqual(client.call_args.kwargs["base_url"], "https://api.siliconflow.cn/v1")
-        request = client.return_value.chat.completions.create.call_args.kwargs
-        self.assertEqual(request["model"], "deepseek-ai/DeepSeek-V3")
-        self.assertIn("Rated voltage: 18 V DC", request["messages"][1]["content"])
+
+    def test_verifier_allows_trailing_zero_and_unit_variants_without_false_reject(self):
+        citations = [{
+            "index": 1, "file_name": "rfq.txt", "location": "第1段",
+            "content": "钢结构平台设计均布荷载为 3.0 kN/m²，干膜总厚度不小于 160 μm。本条已确认。",
+        }]
+        payload = {
+            "conclusion": "钢结构平台均布荷载为 3 kN/m²，干膜厚度不小于 160 um [1]。",
+            "basis": [{"index": 1, "detail": "荷载 3.0 kN/m²，干膜 160 μm"}],
+            "table": [{"item": "荷载", "value": "3 kN/m² [1]"}],
+        }
+        ver = rag_engine.verify_grounded_answer(payload, citations)
+        self.assertTrue(ver["passed"], ver["warnings"])
+
+    def test_verifier_still_blocks_wrong_numbers_out_of_range_cites_and_unapproved(self):
+        citations = [{
+            "index": 1, "file_name": "mom.docx", "location": "第1段",
+            "content": "室外电气控制柜建议改为 IP65，待批准；室内控制柜仍按 IP54 执行。",
+        }]
+        bad_pending = {"conclusion": "室外控制柜已批准采用 IP65 [1]。", "basis": [], "table": []}
+        ver1 = rag_engine.verify_grounded_answer(bad_pending, citations)
+        self.assertFalse(ver1["passed"])
+        self.assertTrue(any("待批准" in w or "已批准" in w for w in ver1["warnings"]))
+
+        bad_num = {"conclusion": "室外控制柜防护等级为 IP68 [1]，待批准。", "basis": [], "table": []}
+        ver2 = rag_engine.verify_grounded_answer(bad_num, citations)
+        self.assertFalse(ver2["passed"])
+        self.assertTrue(any("ip68" in w.lower() for w in ver2["warnings"]))
+
+        bad_cite = {"conclusion": "室外控制柜待批准 [9]。", "basis": [], "table": []}
+        ver3 = rag_engine.verify_grounded_answer(bad_cite, citations)
+        self.assertFalse(ver3["passed"])
+        self.assertEqual(ver3["invalid_citations"], [9])
+
+    def test_bounded_self_correction_recovers_on_second_call(self):
+        hits = [{"id": "1", "doc_id": "1", "doc_name": "x.pdf", "page": 1,
+                 "content": "Rated voltage: 18 V DC", "semantic_score": 0.9}]
+        first_bad = SimpleNamespace(
+            choices=[SimpleNamespace(finish_reason="stop", message=SimpleNamespace(content=json.dumps({
+                "conclusion": "额定电压为 18 V DC",  # Missing citation [1]
+                "basis": [], "table": [],
+            })))],
+            usage=SimpleNamespace(prompt_tokens=100, completion_tokens=30, total_tokens=130),
+        )
+        second_good = SimpleNamespace(
+            choices=[SimpleNamespace(finish_reason="stop", message=SimpleNamespace(content=json.dumps({
+                "conclusion": "额定电压为 18 V DC [1]。",
+                "basis": [], "table": [{"item": "额定电压", "value": "18 V DC [1]"}],
+            })))],
+            usage=SimpleNamespace(prompt_tokens=160, completion_tokens=40, total_tokens=200),
+        )
+        with patch("openai.OpenAI") as client:
+            client.return_value.chat.completions.create.side_effect = [first_bad, second_good]
+            answer = rag_engine.generate_structured_answer("电压是多少", hits, "test", {}, allow_external=True)
+        self.assertEqual(answer["answer_status"], "llm_success")
+        self.assertTrue(answer["verification"]["passed"])
+        self.assertTrue(answer["llm_stats"]["retried"])
+        self.assertEqual(answer["llm_stats"]["api_calls"], 2)
+        self.assertEqual(answer["llm_stats"]["total_tokens"], 330)
 
     def test_opt_in_and_invalid_answer_fall_back(self):
         hits = [{"id": "1", "doc_id": "1", "doc_name": "x.pdf", "page": 1,
@@ -49,8 +114,43 @@ class SiliconFlowTests(unittest.TestCase):
             rag_engine.generate_structured_answer("电压", hits, "test", {})
             call.assert_not_called()
             answer = rag_engine.generate_structured_answer("电压", hits, "test", {}, allow_external=True)
+        self.assertEqual(answer["answer_status"], "verification_failed")
         self.assertNotIn("99 V", answer["conclusion"])
         self.assertTrue(answer["verification"]["warnings"])
+        self.assertIn("99v", answer["diagnostic"]["message"].lower())
+
+    def test_error_classification_for_auth_timeout_truncated_and_invalid_json(self):
+        hits = [{"id": "1", "doc_id": "1", "doc_name": "x.pdf", "page": 1,
+                 "content": "Rated voltage: 18 V DC", "semantic_score": 0.9}]
+
+        class FakeAuthError(Exception):
+            status_code = 401
+
+        with patch("openai.OpenAI") as client:
+            client.return_value.chat.completions.create.side_effect = FakeAuthError("Unauthorized")
+            ans_auth = rag_engine.generate_structured_answer("电压", hits, "test", {}, allow_external=True)
+        self.assertEqual(ans_auth["answer_status"], "llm_call_failed")
+        self.assertEqual(ans_auth["diagnostic"]["code"], "auth_error")
+
+        truncated = SimpleNamespace(
+            choices=[SimpleNamespace(finish_reason="length", message=SimpleNamespace(content='{"conclusion": "partial'))],
+            usage=SimpleNamespace(prompt_tokens=50, completion_tokens=2048, total_tokens=2098),
+        )
+        with patch("openai.OpenAI") as client:
+            client.return_value.chat.completions.create.return_value = truncated
+            ans_trunc = rag_engine.generate_structured_answer("电压", hits, "test", {}, allow_external=True)
+        self.assertEqual(ans_trunc["answer_status"], "llm_call_failed")
+        self.assertEqual(ans_trunc["diagnostic"]["code"], "truncated")
+
+        bad_json = SimpleNamespace(
+            choices=[SimpleNamespace(finish_reason="stop", message=SimpleNamespace(content="不是 JSON 格式的回答"))],
+            usage=SimpleNamespace(prompt_tokens=50, completion_tokens=10, total_tokens=60),
+        )
+        with patch("openai.OpenAI") as client:
+            client.return_value.chat.completions.create.return_value = bad_json
+            ans_json = rag_engine.generate_structured_answer("电压", hits, "test", {}, allow_external=True)
+        self.assertEqual(ans_json["answer_status"], "llm_call_failed")
+        self.assertEqual(ans_json["diagnostic"]["code"], "invalid_json")
 
 
 if __name__ == "__main__":

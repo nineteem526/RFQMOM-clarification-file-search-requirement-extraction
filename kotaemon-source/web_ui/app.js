@@ -364,8 +364,36 @@ function renderChatFeed() {
     .map((turn, tIdx) => {
       const p = turn.payload || {};
       const r = p.retrieval || {};
-      const scopeText = r.scope ? r.scope + " · " + r.evidence_count + " 条回答依据" : "";
-      const verificationWarnings = ((p.verification || {}).warnings || []).map((message) => '<li>' + esc(message) + '</li>').join("");
+      const st = p.answer_status || (p.llm_provider && p.llm_provider !== "本地原文摘录" && p.llm_provider !== "本地检索" ? "llm_success" : "local_only");
+      const diag = p.diagnostic || {};
+      const stats = p.llm_stats || {};
+      const scopeText = r.scope ? r.scope + " · " + (r.evidence_count ?? (p.citations || []).length) + " 条回答依据" : "";
+
+      const statusMeta = {
+        llm_success: { cls: "st-ok", label: `模型生成 · ${p.llm_provider || "在线模型"}${stats.retried ? "（经1次自纠正）" : ""}` },
+        llm_call_failed: { cls: "st-err", label: "模型调用失败 · 已回退本地原文摘录" },
+        verification_failed: { cls: "st-warn", label: "未通过证据校验 · 已回退本地原文摘录" },
+        no_evidence: { cls: "st-muted", label: "未检索到满足阈值的证据" },
+        local_only: { cls: "st-muted", label: "本地原文摘录" },
+      }[st] || { cls: "st-muted", label: p.llm_provider || "本地原文摘录" };
+
+      const statsParts = [];
+      if (stats.api_calls > 0) statsParts.push(`API ${stats.api_calls} 次`);
+      if (stats.total_tokens > 0) statsParts.push(`${stats.total_tokens} tokens`);
+      if (stats.latency_ms > 0) statsParts.push(`${Math.round(stats.latency_ms)} ms`);
+      if (p.cached) statsParts.push("缓存命中");
+      const statsHtml = statsParts.length ? `<span class="answer-stats">${esc(statsParts.join(" · "))}</span>` : "";
+
+      const diagHtml = (st === "llm_call_failed" || st === "verification_failed") && diag.message
+        ? `<div class="answer-diag-box ${statusMeta.cls}">
+             <div class="diag-msg">${esc(diag.message)}</div>
+             ${diag.next_step ? `<div class="diag-next">建议下一步：${esc(diag.next_step)}</div>` : ""}
+           </div>`
+        : "";
+      const verificationWarnings = (st === "llm_call_failed" || st === "verification_failed")
+        ? ""
+        : ((p.verification || {}).warnings || []).map((message) => '<li>' + esc(message) + '</li>').join("");
+
       const basisHtml = (p.basis || []).length
         ? `<div class="answer-subhead">主要依据</div>
            <ul class="basis-list">
@@ -383,7 +411,7 @@ function renderChatFeed() {
              <tbody>
                ${p.table
                  .map(
-                   (r) => `<tr><td>${esc(r.item)}</td><td>${formatInlineMarkdown(r.value)}</td></tr>`
+                   (row) => `<tr><td>${esc(row.item)}</td><td>${formatInlineMarkdown(row.value)}</td></tr>`
                  )
                  .join("")}
              </tbody>
@@ -396,8 +424,15 @@ function renderChatFeed() {
             <div class="msg-time">${esc(turn.time)}</div>
           </div>
           <div class="ai-answer">
-            <div class="blue-bar-title">检索结论</div>
+            <div class="answer-head-row">
+              <div class="blue-bar-title">检索结论</div>
+              <div class="answer-status-meta">
+                <span class="answer-status-pill ${statusMeta.cls}">${esc(statusMeta.label)}</span>
+                ${statsHtml}
+              </div>
+            </div>
             ${scopeText ? '<p class="rail-sub">' + esc(scopeText) + '</p>' : ""}
+            ${diagHtml}
             ${verificationWarnings ? '<ul class="basis-list">' + verificationWarnings + '</ul>' : ""}
             <p class="answer-paragraph">${formatInlineMarkdown(p.conclusion || "")}</p>
             ${basisHtml}

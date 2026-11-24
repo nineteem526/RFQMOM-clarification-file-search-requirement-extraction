@@ -1280,8 +1280,29 @@ def create_web_app(runtime_root: Path | None = None) -> FastAPI:
         ocr_status = "已关闭"
         if cfg.get("ocr_enabled"):
             ocr_status = "已启用（按页识别）" if interpreter_available else "本地 OCR 未安装"
+        last_call_note = ""
+        if cfg.get("online_answers_enabled") is True and llm.get("configured"):
+            with store._conn() as conn:
+                last_row = conn.execute(
+                    "SELECT payload_json FROM chat_messages ORDER BY rowid DESC LIMIT 1"
+                ).fetchone()
+            if last_row:
+                try:
+                    lp = json.loads(last_row["payload_json"])
+                    ast = lp.get("answer_status")
+                    if ast == "llm_success":
+                        last_call_note = " · 最近调用成功"
+                    elif ast == "llm_call_failed":
+                        code = (lp.get("diagnostic") or {}).get("code", "error")
+                        last_call_note = f" · 最近调用失败({code})"
+                    elif ast == "verification_failed":
+                        last_call_note = " · 最近回答未通过校验"
+                except Exception:
+                    pass
+            if not last_call_note:
+                last_call_note = "（尚未在当前项目实测调用）"
         return {
-            "model_api": llm["status_text"] if cfg.get("online_answers_enabled") is True else "本项目使用本地检索",
+            "model_api": (llm["status_text"] + last_call_note) if cfg.get("online_answers_enabled") is True else "本项目使用本地检索",
             "vector_service": "本地 BGE 512维就绪" if emb.get("ok") else "向量模型未就绪",
             "index_service": f"运行中（文档 {len(docs)} 篇 · 向量块 {vec_cnt}/{chunk_cnt}）",
             "ocr_service": ocr_status,
