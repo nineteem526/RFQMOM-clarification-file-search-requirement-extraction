@@ -4,9 +4,12 @@ const state = {
   projects: [],
   projectId: "rfq-demo",
   activeTab: "qa",
+  qaRightTab: "preview",
   docsData: { folders: [], tree: [], documents: [], total: 0, last_updated: "" },
-  selectedFolder: null, // null = all or first folder
+  selectedFolder: null, // null = 全部资料
   selectedDocId: null,
+  collapsedFolders: new Set(),
+  foldersInitializedForProject: null,
   qaSearch: "",
   docsSearch: "",
   chatMessages: [],
@@ -15,17 +18,17 @@ const state = {
   previewChunks: [],
   previewChunkIdx: 0,
   previewDocId: null,
-  compareLeftId: null,
-  compareRightId: null,
-  compareKeyword: "",
-  compareSections: [],
-  compareData: null,
   savedKind: "all",
   savedKeyword: "",
   savedItems: [],
   selectedSavedId: null,
   settingsData: null,
   statusData: null,
+  llmConfig: null,
+  llmStatus: null,
+  isAdmin: false,
+  adminToken: sessionStorage.getItem("rfq_admin_token") || "",
+  userPreferredMode: localStorage.getItem("rfq_default_qa_mode") || "快速问答",
 };
 
 const $ = (sel) => document.querySelector(sel);
@@ -48,7 +51,11 @@ function showToast(msg) {
 }
 
 async function api(url, opts = {}) {
-  const res = await fetch(url, opts);
+  const headers = new Headers(opts.headers || {});
+  if (state.adminToken) {
+    headers.set("X-Admin-Token", state.adminToken);
+  }
+  const res = await fetch(url, { ...opts, headers });
   if (!res.ok) {
     let detail = `请求失败 (${res.status})`;
     try {
@@ -85,6 +92,47 @@ function formatInlineMarkdown(text) {
   return html;
 }
 
+/* ==================== RESIZABLE SPLIT PANELS ==================== */
+function initResizers() {
+  $$(".split-layout").forEach((layout) => {
+    const resizer = layout.querySelector(".split-resizer");
+    if (!resizer) return;
+    const key = resizer.dataset.split || layout.id;
+    const savedW = localStorage.getItem(`rfq_split_w_${key}`);
+    if (savedW && Number(savedW) >= 280) {
+      layout.style.setProperty("--split-right-w", `${savedW}px`);
+    }
+
+    resizer.addEventListener("mousedown", (e) => {
+      e.preventDefault();
+      const layoutRect = layout.getBoundingClientRect();
+      resizer.classList.add("dragging");
+      document.body.classList.add("is-resizing");
+
+      const onMove = (ev) => {
+        const minRight = 280;
+        const maxRight = Math.max(320, layoutRect.width - 380);
+        const nextW = Math.round(Math.min(maxRight, Math.max(minRight, layoutRect.right - ev.clientX)));
+        layout.style.setProperty("--split-right-w", `${nextW}px`);
+      };
+
+      const onUp = () => {
+        resizer.classList.remove("dragging");
+        document.body.classList.remove("is-resizing");
+        document.removeEventListener("mousemove", onMove);
+        document.removeEventListener("mouseup", onUp);
+        const finalW = parseInt(layout.style.getPropertyValue("--split-right-w"), 10);
+        if (finalW >= 280) {
+          localStorage.setItem(`rfq_split_w_${key}`, String(finalW));
+        }
+      };
+
+      document.addEventListener("mousemove", onMove);
+      document.addEventListener("mouseup", onUp);
+    });
+  });
+}
+
 /* ==================== PROJECTS & SWITCHER ==================== */
 async function loadProjects(preferredId = null) {
   const data = await api("/api/projects");
@@ -102,6 +150,9 @@ function renderProjectSwitcher() {
   const cur = state.projects.find((p) => p.id === state.projectId);
   $("#current-project-name").textContent = cur ? cur.name : state.projectId;
   $("#saved-project-readonly").value = cur ? cur.name : state.projectId;
+  if ($("#user-general-project")) {
+    $("#user-general-project").textContent = cur ? cur.name : state.projectId;
+  }
 
   const list = $("#project-list");
   list.innerHTML = state.projects
@@ -126,9 +177,7 @@ function renderProjectSwitcher() {
         state.projectId = pid;
         state.selectedFolder = null;
         state.selectedDocId = null;
-        state.compareLeftId = null;
-        state.compareRightId = null;
-        state.compareSections = [];
+        state.foldersInitializedForProject = null;
         state.selectedSavedId = null;
         renderProjectSwitcher();
         await reloadProjectContext();
@@ -146,22 +195,27 @@ async function reloadProjectContext() {
     loadSavedItems(),
     loadSettings(),
   ]);
-  initCompareDefaults();
 }
 
-/* ==================== DOCUMENTS TREE & TABLE ==================== */
+/* ==================== DOCUMENTS TREE (QA RIGHT) & TABLE (DOCS TAB) ==================== */
 async function loadDocuments() {
   const data = await api(`/api/projects/${encodeURIComponent(state.projectId)}/documents`);
   state.docsData = data;
-  if (!state.selectedFolder && data.tree.length) {
-    const firstNonEmpty = data.tree.find((g) => g.count > 0) || data.tree[0];
-    state.selectedFolder = firstNonEmpty.name;
+  if (state.foldersInitializedForProject !== state.projectId) {
+    state.foldersInitializedForProject = state.projectId;
+    state.collapsedFolders = new Set();
+    if ((data.total || 0) >= 6) {
+      (data.tree || []).forEach((g) => state.collapsedFolders.add(g.name));
+    }
+  }
+  if (state.selectedFolder && !(data.folders || []).includes(state.selectedFolder)) {
+    state.selectedFolder = null;
   }
   if (!state.selectedDocId && data.documents.length) {
-    const inFolder = data.documents.find((d) => d.folder === state.selectedFolder) || data.documents[0];
-    state.selectedDocId = inFolder.id;
+    state.selectedDocId = data.documents[0].id;
   }
-  renderDocTrees();
+  renderQaDocTree();
+  renderFolderChips();
   renderDocsTable();
   if (state.selectedDocId) {
     await loadDocDetail(state.selectedDocId);
@@ -169,97 +223,139 @@ async function loadDocuments() {
     renderEmptyDocDetail();
   }
   populateUploadFolders();
+  if ($("#user-general-docs")) {
+    $("#user-general-docs").textContent = String(data.total || 0);
+  }
 }
 
-function buildTreeHtml(tree, searchTerm, activeDocId, activeFolder, mode) {
-  const term = searchTerm.trim().toLowerCase();
-  if (!tree.length) return '<div class="empty-state-box">暂无文件夹</div>';
-  return tree
+function updateToggleAllFoldersLabel() {
+  const btn = $("#btn-toggle-all-folders");
+  if (!btn) return;
+  const nonEmpty = (state.docsData.tree || []).filter((g) => g.count > 0);
+  const allCollapsed = nonEmpty.length > 0 && nonEmpty.every((g) => state.collapsedFolders.has(g.name));
+  btn.textContent = allCollapsed ? "全部展开" : "全部收起";
+}
+
+function renderQaDocTree() {
+  const total = state.docsData.total || 0;
+  const updated = state.docsData.last_updated || "";
+  $("#qa-doc-count").textContent = `${total} 份文件`;
+  $("#qa-doc-badge").textContent = String(total);
+  $("#qa-rail-footer").textContent = updated ? `最近更新 ${updated}` : "已索引";
+
+  const container = $("#qa-doc-tree");
+  const tree = state.docsData.tree || [];
+  const term = state.qaSearch.trim().toLowerCase();
+  if (!tree.length) {
+    container.innerHTML = '<div class="empty-state-box">暂无项目资料</div>';
+    return;
+  }
+
+  const activeDocId = state.previewDocId || state.selectedDocId;
+  const html = tree
     .map((group) => {
       const docs = term
         ? group.documents.filter((d) => d.name.toLowerCase().includes(term))
         : group.documents;
       if (term && !docs.length) return "";
-      const isFolderActive = mode === "docs" && activeFolder === group.name;
+      const isCollapsed = term ? false : state.collapsedFolders.has(group.name);
       return `
-        <div class="tree-folder">
-          <button class="tree-folder-head ${isFolderActive ? "active" : ""}" data-folder="${esc(group.name)}" type="button">
-            <span>⌄</span>
-            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
+        <div class="tree-folder ${isCollapsed ? "collapsed" : ""}" data-folder="${esc(group.name)}">
+          <button class="tree-folder-head" data-folder="${esc(group.name)}" type="button">
+            <span class="tree-chevron" aria-hidden="true">
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="m6 9 6 6 6-6"/></svg>
+            </span>
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
             <span>${esc(group.name)}</span>
-            <span class="tree-folder-count">(${group.count})</span>
+            <span class="tree-folder-count">${group.count}</span>
           </button>
-          <ul class="tree-files">
-            ${docs
-              .map(
-                (d) => `
-              <li>
-                <button class="tree-file-btn ${d.id === activeDocId ? "active" : ""}" data-doc-id="${esc(d.id)}" data-folder="${esc(group.name)}" type="button">
-                  <span class="tree-file-left">
-                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/></svg>
-                    <span class="tree-file-name" title="${esc(d.name)}">${esc(d.name)}</span>
-                  </span>
-                  ${d.version ? `<span class="tree-file-ver">(${esc(d.version)})</span>` : ""}
-                </button>
-              </li>`
-              )
-              .join("")}
-          </ul>
+          <div class="tree-folder-body">
+            <ul class="tree-files">
+              ${docs
+                .map(
+                  (d) => `
+                <li>
+                  <button class="tree-file-btn ${d.id === activeDocId ? "active" : ""}" data-doc-id="${esc(d.id)}" type="button">
+                    <span class="tree-file-left">
+                      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/></svg>
+                      <span class="tree-file-name" title="${esc(d.name)}">${esc(d.name)}</span>
+                    </span>
+                    ${d.version ? `<span class="tree-file-ver">${esc(d.version)}</span>` : ""}
+                  </button>
+                </li>`
+                )
+                .join("")}
+            </ul>
+          </div>
         </div>
       `;
     })
     .join("");
-}
 
-function renderDocTrees() {
-  const total = state.docsData.total || 0;
-  const updated = state.docsData.last_updated || "";
-  $("#qa-doc-count").textContent = `${total} 份文件`;
-  $("#docs-doc-count").textContent = `${total} 份文件`;
-  $("#qa-rail-footer").textContent = `资料已索引 · 最近更新 ${updated}`;
-  $("#docs-rail-footer").textContent = `资料已索引 · 最近更新 ${updated}`;
+  container.innerHTML = html || '<div class="empty-state-box">未找到匹配的文件</div>';
+  updateToggleAllFoldersLabel();
 
-  const qaContainer = $("#qa-doc-tree");
-  qaContainer.innerHTML = buildTreeHtml(state.docsData.tree, state.qaSearch, state.previewDocId || state.selectedDocId, state.selectedFolder, "qa");
-  qaContainer.querySelectorAll(".tree-file-btn").forEach((btn) => {
+  container.querySelectorAll(".tree-folder-head").forEach((head) => {
+    head.addEventListener("click", () => {
+      const folderEl = head.closest(".tree-folder");
+      const folderName = head.dataset.folder;
+      const nowCollapsed = folderEl.classList.toggle("collapsed");
+      if (nowCollapsed) {
+        state.collapsedFolders.add(folderName);
+      } else {
+        state.collapsedFolders.delete(folderName);
+      }
+      updateToggleAllFoldersLabel();
+    });
+  });
+
+  container.querySelectorAll(".tree-file-btn").forEach((btn) => {
     btn.addEventListener("click", async () => {
       const docId = btn.dataset.docId;
       state.selectedDocId = docId;
       await openDocInQaPreview(docId);
-      renderDocTrees();
+      setQaRightTab("preview");
+      renderQaDocTree();
     });
   });
+}
 
-  const docsContainer = $("#docs-doc-tree");
-  docsContainer.innerHTML = buildTreeHtml(state.docsData.tree, state.docsSearch, state.selectedDocId, state.selectedFolder, "docs");
-  docsContainer.querySelectorAll(".tree-folder-head").forEach((btn) => {
-    btn.addEventListener("click", () => {
-      state.selectedFolder = btn.dataset.folder;
-      renderDocTrees();
+function renderFolderChips() {
+  const box = $("#docs-folder-chips");
+  if (!box) return;
+  const total = state.docsData.total || 0;
+  const tree = state.docsData.tree || [];
+  const chips = [
+    `<button class="folder-chip ${state.selectedFolder === null ? "active" : ""}" data-folder="" type="button">全部 (${total})</button>`,
+    ...tree.map(
+      (g) => `<button class="folder-chip ${state.selectedFolder === g.name ? "active" : ""}" data-folder="${esc(g.name)}" type="button">${esc(g.name)} (${g.count})</button>`
+    ),
+  ];
+  box.innerHTML = chips.join("");
+  box.querySelectorAll(".folder-chip").forEach((chip) => {
+    chip.addEventListener("click", () => {
+      const f = chip.dataset.folder;
+      state.selectedFolder = f ? f : null;
+      renderFolderChips();
       renderDocsTable();
-    });
-  });
-  docsContainer.querySelectorAll(".tree-file-btn").forEach((btn) => {
-    btn.addEventListener("click", async () => {
-      state.selectedFolder = btn.dataset.folder;
-      state.selectedDocId = btn.dataset.docId;
-      renderDocTrees();
-      renderDocsTable();
-      await loadDocDetail(state.selectedDocId);
     });
   });
 }
 
 function renderDocsTable() {
   const folder = state.selectedFolder;
+  const term = state.docsSearch.trim().toLowerCase();
   const allDocs = state.docsData.documents || [];
-  const filtered = folder ? allDocs.filter((d) => d.folder === folder) : allDocs;
+  let filtered = folder ? allDocs.filter((d) => d.folder === folder) : allDocs;
+  if (term) {
+    filtered = filtered.filter((d) => d.name.toLowerCase().includes(term));
+  }
   $("#docs-folder-title").textContent = folder || "全部资料";
   $("#docs-folder-count").textContent = `共 ${filtered.length} 份文件`;
 
   const tbody = $("#docs-table-body");
   if (!filtered.length) {
-    tbody.innerHTML = `<tr><td colspan="5"><div class="empty-state-box">当前目录下暂无文件，请点击右上角“上传资料”导入工程文档。</div></td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="5"><div class="empty-state-box">当前条件下暂无文件，可点击右上角“上传资料”导入工程文档。</div></td></tr>`;
     return;
   }
   tbody.innerHTML = filtered
@@ -284,7 +380,6 @@ function renderDocsTable() {
   tbody.querySelectorAll("tr[data-doc-id]").forEach((tr) => {
     tr.addEventListener("click", async () => {
       state.selectedDocId = tr.dataset.docId;
-      renderDocTrees();
       renderDocsTable();
       await loadDocDetail(state.selectedDocId);
     });
@@ -306,10 +401,10 @@ async function loadDocDetail(docId) {
       <div class="kv-row"><dt>文件大小</dt><dd>${formatSize(doc.size_bytes)}</dd></div>
     `;
     const chunk = data.active_chunk;
-    const warnings = (doc.parse_warnings || []).map((message) => '<li>' + esc(message) + '</li>').join("");
-    $("#detail-preview-body").innerHTML = (warnings ? '<ul class="basis-list">' + warnings + '</ul>' : "") + (chunk
-      ? highlightText(chunk.content, chunk.highlight, "hl-yellow")
-      : '<div class="empty-state-box">暂无可预览文本内容</div>');
+    const warnings = (doc.parse_warnings || []).map((message) => "<li>" + esc(message) + "</li>").join("");
+    $("#detail-preview-body").innerHTML =
+      (warnings ? '<ul class="basis-list">' + warnings + "</ul>" : "") +
+      (chunk ? highlightText(chunk.content, chunk.highlight, "hl-yellow") : '<div class="empty-state-box">暂无可预览文本内容</div>');
   } catch {
     renderEmptyDocDetail();
   }
@@ -319,7 +414,7 @@ function renderEmptyDocDetail() {
   $("#detail-doc-name").textContent = "未选择文件";
   $("#detail-open-source").href = "#";
   $("#detail-kv-grid").innerHTML = "";
-  $("#detail-preview-body").innerHTML = '<div class="empty-state-box">点击左侧或中间列表中的文件查看详情与内容预览。</div>';
+  $("#detail-preview-body").innerHTML = '<div class="empty-state-box">点击左侧列表中的文件查看详情与内容预览。</div>';
 }
 
 function populateUploadFolders() {
@@ -329,7 +424,14 @@ function populateUploadFolders() {
     .join("");
 }
 
-/* ==================== TAB 1: QA & PREVIEW ==================== */
+/* ==================== TAB 1: QA & RIGHT PANEL ==================== */
+function setQaRightTab(tab) {
+  state.qaRightTab = tab;
+  $$("#view-qa .seg-tab").forEach((b) => b.classList.toggle("active", b.dataset.qaRight === tab));
+  $("#qa-panel-preview").classList.toggle("hidden", tab !== "preview");
+  $("#qa-panel-docs").classList.toggle("hidden", tab !== "docs");
+}
+
 async function loadChatHistory() {
   const data = await api(`/api/projects/${encodeURIComponent(state.projectId)}/chat/history`);
   state.chatMessages = data.messages || [];
@@ -355,7 +457,7 @@ function renderChatFeed() {
     feed.innerHTML = `
       <div class="empty-state-box" style="margin-top:48px;">
         <h3 style="margin:0 0 8px;color:#111827;font-size:18px;">当前项目：${esc(proj ? proj.name : state.projectId)}</h3>
-        <p style="margin:0;color:#6b7280;">在下方输入工程问题（如“电控柜的防护等级要求是什么？”），系统将在当前项目的独立数据库内检索并定位原文出处。</p>
+        <p style="margin:0;color:#6b7280;">在下方直接输入工程问题，系统将针对当前项目数据库检索原文并给出简明结论与出处。</p>
       </div>
     `;
     return;
@@ -363,60 +465,54 @@ function renderChatFeed() {
   feed.innerHTML = state.chatMessages
     .map((turn, tIdx) => {
       const p = turn.payload || {};
-      const r = p.retrieval || {};
       const st = p.answer_status || (p.llm_provider && p.llm_provider !== "本地原文摘录" && p.llm_provider !== "本地检索" ? "llm_success" : "local_only");
       const diag = p.diagnostic || {};
       const stats = p.llm_stats || {};
-      const scopeText = r.scope ? r.scope + " · " + (r.evidence_count ?? (p.citations || []).length) + " 条回答依据" : "";
 
       const statusMeta = {
-        llm_success: { cls: "st-ok", label: `模型生成 · ${p.llm_provider || "在线模型"}${stats.retried ? "（经1次自纠正）" : ""}` },
-        llm_call_failed: { cls: "st-err", label: "模型调用失败 · 已回退本地原文摘录" },
-        verification_failed: { cls: "st-warn", label: "未通过证据校验 · 已回退本地原文摘录" },
-        no_evidence: { cls: "st-muted", label: "未检索到满足阈值的证据" },
+        llm_success: { cls: "st-ok", label: stats.retried ? "在线回答（已复核）" : "在线回答" },
+        llm_call_failed: { cls: "st-err", label: "模型调用失败 · 本地摘录" },
+        verification_failed: { cls: "st-warn", label: "未通过校验 · 本地摘录" },
+        no_evidence: { cls: "st-muted", label: "未命中依据" },
         local_only: { cls: "st-muted", label: "本地原文摘录" },
       }[st] || { cls: "st-muted", label: p.llm_provider || "本地原文摘录" };
 
-      const statsParts = [];
-      if (stats.api_calls > 0) statsParts.push(`API ${stats.api_calls} 次`);
-      if (stats.total_tokens > 0) statsParts.push(`${stats.total_tokens} tokens`);
-      if (stats.latency_ms > 0) statsParts.push(`${Math.round(stats.latency_ms)} ms`);
-      if (p.cached) statsParts.push("缓存命中");
-      const statsHtml = statsParts.length ? `<span class="answer-stats">${esc(statsParts.join(" · "))}</span>` : "";
+      const diagHtml =
+        (st === "llm_call_failed" || st === "verification_failed") && diag.message
+          ? `<div class="answer-diag-box ${statusMeta.cls}">
+               <div class="diag-msg">${esc(diag.message)}</div>
+               ${diag.next_step ? `<div class="diag-next">建议：${esc(diag.next_step)}</div>` : ""}
+             </div>`
+          : "";
 
-      const diagHtml = (st === "llm_call_failed" || st === "verification_failed") && diag.message
-        ? `<div class="answer-diag-box ${statusMeta.cls}">
-             <div class="diag-msg">${esc(diag.message)}</div>
-             ${diag.next_step ? `<div class="diag-next">建议下一步：${esc(diag.next_step)}</div>` : ""}
-           </div>`
-        : "";
-      const verificationWarnings = (st === "llm_call_failed" || st === "verification_failed")
-        ? ""
-        : ((p.verification || {}).warnings || []).map((message) => '<li>' + esc(message) + '</li>').join("");
-
-      const basisHtml = (p.basis || []).length
-        ? `<div class="answer-subhead">主要依据</div>
-           <ul class="basis-list">
-             ${p.basis
-               .map(
-                 (b) => `<li><strong>${esc(b.source)}：</strong>${formatInlineMarkdown(b.detail)}</li>`
-               )
-               .join("")}
-           </ul>`
-        : "";
+      // Only render table if user/model explicitly produced a structured comparison table
       const tableHtml = (p.table || []).length
-        ? `<div class="answer-subhead">相关信息汇总</div>
-           <table class="summary-table">
+        ? `<table class="summary-table">
              <thead><tr><th style="width:28%;">项目</th><th>要求 / 说明</th></tr></thead>
              <tbody>
                ${p.table
-                 .map(
-                   (row) => `<tr><td>${esc(row.item)}</td><td>${formatInlineMarkdown(row.value)}</td></tr>`
-                 )
+                 .map((row) => `<tr><td>${esc(row.item)}</td><td>${formatInlineMarkdown(row.value)}</td></tr>`)
                  .join("")}
              </tbody>
            </table>`
         : "";
+
+      const citations = p.citations || [];
+      const compactSourcesHtml = citations.length
+        ? `<div class="compact-sources">
+             <span class="compact-sources-label">原文出处：</span>
+             ${citations
+               .map(
+                 (c, i) => `
+               <button class="source-chip" data-turn-idx="${tIdx}" data-cite-idx="${i}" type="button" title="在右侧原文预览查看">
+                 <span class="source-chip-idx">[${c.index}]</span>
+                 <span>${esc(c.file_name)} · ${esc(c.location || c.section)}</span>
+               </button>`
+               )
+               .join("")}
+           </div>`
+        : "";
+
       return `
         <div class="chat-turn" data-turn-idx="${tIdx}">
           <div class="user-msg-wrap">
@@ -425,18 +521,13 @@ function renderChatFeed() {
           </div>
           <div class="ai-answer">
             <div class="answer-head-row">
-              <div class="blue-bar-title">检索结论</div>
-              <div class="answer-status-meta">
-                <span class="answer-status-pill ${statusMeta.cls}">${esc(statusMeta.label)}</span>
-                ${statsHtml}
-              </div>
+              <div class="blue-bar-title">回答结果</div>
+              <span class="answer-status-pill ${statusMeta.cls}">${esc(statusMeta.label)}</span>
             </div>
-            ${scopeText ? '<p class="rail-sub">' + esc(scopeText) + '</p>' : ""}
             ${diagHtml}
-            ${verificationWarnings ? '<ul class="basis-list">' + verificationWarnings + '</ul>' : ""}
             <p class="answer-paragraph">${formatInlineMarkdown(p.conclusion || "")}</p>
-            ${basisHtml}
             ${tableHtml}
+            ${compactSourcesHtml}
             <div class="answer-actions">
               <button class="btn-secondary btn-xs btn-save-turn" data-turn-idx="${tIdx}" type="button">保存到已保存</button>
             </div>
@@ -454,6 +545,18 @@ function renderChatFeed() {
       const turn = state.chatMessages[tIdx];
       if (turn && turn.payload && turn.payload.citations) {
         setQaCitations(turn.payload.citations, Math.max(0, citeNum));
+        setQaRightTab("preview");
+      }
+    });
+  });
+
+  feed.querySelectorAll(".source-chip").forEach((chip) => {
+    chip.addEventListener("click", () => {
+      const turn = state.chatMessages[Number(chip.dataset.turnIdx)];
+      const citeIdx = Number(chip.dataset.citeIdx);
+      if (turn && turn.payload && turn.payload.citations) {
+        setQaCitations(turn.payload.citations, citeIdx);
+        setQaRightTab("preview");
       }
     });
   });
@@ -548,7 +651,7 @@ function renderQaPreviewCard(name, loc, page, totalPages, content, highlight, do
 
 function renderEmptyQaPreview() {
   $("#qa-preview-name").textContent = "暂无原文预览";
-  $("#qa-preview-loc").textContent = "上传文档或提问后在此定位原文";
+  $("#qa-preview-loc").textContent = "提出问题或切换“项目资料”点选文件查看原文";
   $("#qa-page-indicator").textContent = "- / -";
   $("#qa-preview-body").innerHTML = '<div class="empty-state-box">当前项目数据库暂无可预览文档。</div>';
   $("#qa-open-full-file").href = "#";
@@ -572,6 +675,7 @@ async function handleSendQuestion() {
     state.chatMessages.push(data.turn);
     renderChatFeed();
     setQaCitations(data.turn.payload?.citations || [], 0);
+    setQaRightTab("preview");
   } catch (err) {
     showToast(err.message);
   } finally {
@@ -580,128 +684,7 @@ async function handleSendQuestion() {
   }
 }
 
-/* ==================== TAB 3: COMPARE ==================== */
-function initCompareDefaults() {
-  const docs = state.docsData.documents || [];
-  const leftSel = $("#compare-left-select");
-  const rightSel = $("#compare-right-select");
-  const opts = docs.map((d) => `<option value="${esc(d.id)}">${esc(d.name)} (${esc(d.version)})</option>`).join("");
-  leftSel.innerHTML = opts;
-  rightSel.innerHTML = opts;
-
-  if (docs.length >= 2) {
-    const clar = docs.find((d) => d.name.includes("Clarification 02")) || docs[1];
-    const rfq = docs.find((d) => d.name.includes("RFQ Rev.A")) || docs[0];
-    state.compareLeftId = state.compareLeftId || rfq.id;
-    state.compareRightId = state.compareRightId || (clar.id === state.compareLeftId ? docs[1].id : clar.id);
-    leftSel.value = state.compareLeftId;
-    rightSel.value = state.compareRightId;
-    runCompare();
-  } else {
-    $("#compare-selected-pills").innerHTML = '<div class="rail-sub">当前项目需要至少 2 份文档才能进行对照</div>';
-    $("#compare-board").innerHTML = '<div class="empty-state-box">请在“资料”页上传至少两份文档后使用原文对照功能。</div>';
-    $("#compare-summary-list").innerHTML = "";
-    $("#compare-diff-count").textContent = "共 0 项主要差异";
-  }
-}
-
-async function runCompare() {
-  if (!state.compareLeftId || !state.compareRightId) return;
-  try {
-    const data = await api(`/api/projects/${encodeURIComponent(state.projectId)}/compare`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        left_id: state.compareLeftId,
-        right_id: state.compareRightId,
-        keyword: state.compareKeyword,
-        sections: state.compareSections,
-      }),
-    });
-    state.compareData = data;
-    renderCompareView(data);
-  } catch (err) {
-    showToast(err.message);
-  }
-}
-
-function renderCompareView(data) {
-  const lDoc = data.left_doc;
-  const rDoc = data.right_doc;
-  $("#compare-selected-pills").innerHTML = `
-    <div class="selected-doc-pill"><span>📄 ${esc(lDoc.name)}</span></div>
-    <div class="selected-doc-pill"><span>📄 ${esc(rDoc.name)}</span></div>
-  `;
-
-  const secBox = $("#compare-section-checks");
-  secBox.innerHTML = (data.available_sections || [])
-    .map(
-      (sec) => `
-      <label class="checkbox-item">
-        <input type="checkbox" value="${esc(sec)}" ${state.compareSections.includes(sec) ? "checked" : ""} />
-        <span>${esc(sec)}</span>
-      </label>
-    `
-    )
-    .join("");
-  secBox.querySelectorAll("input[type=checkbox]").forEach((cb) => {
-    cb.addEventListener("change", () => {
-      state.compareSections = Array.from(secBox.querySelectorAll("input:checked")).map((x) => x.value);
-      runCompare();
-    });
-  });
-
-  const kw = data.keyword || "";
-  const groupsHtml = (data.groups || []).length
-    ? data.groups
-        .map(
-          (g) => `
-        <div class="cmp-sec-banner">${esc(g.section)}</div>
-        ${g.rows
-          .map((row) => {
-            const lText = row.left
-              ? highlightText(row.left.content, kw || row.left.highlight, "hl-left")
-              : '<span style="color:#9ca3af;">（当前范围无对应条款）</span>';
-            const rText = row.right
-              ? highlightText(row.right.content, kw || row.right.highlight, "hl-right")
-              : '<span style="color:#9ca3af;">（当前范围无对应条款）</span>';
-            return `<div class="cmp-row"><div class="cmp-cell">${lText}</div><div class="cmp-cell">${rText}</div></div>`;
-          })
-          .join("")}
-      `
-        )
-        .join("")
-    : '<div class="empty-state-box">当前筛选条件下无匹配的对照片段，可清空关键词或取消章节勾选。</div>';
-
-  $("#compare-board").innerHTML = `
-    <div class="cmp-table">
-      <div class="cmp-doc-heads">
-        <div class="cmp-doc-head">📄 ${esc(lDoc.name)} <span>(${esc(lDoc.version)})</span></div>
-        <div class="cmp-doc-head">📄 ${esc(rDoc.name)} <span>(${esc(rDoc.version)})</span></div>
-      </div>
-      ${groupsHtml}
-    </div>
-  `;
-
-  const summary = data.summary || [];
-  $("#compare-diff-count").textContent = `共 ${summary.length} 项主要差异`;
-  $("#compare-summary-list").innerHTML = summary
-    .map(
-      (item, idx) => `
-      <div class="diff-item">
-        <span class="diff-num">${idx + 1}</span>
-        <div>
-          <h4>${esc(item.title)}</h4>
-          <p>${esc(item.detail)}</p>
-        </div>
-      </div>
-    `
-    )
-    .join("");
-  $("#compare-conclusion-text").textContent = data.conclusion || "";
-}
-
-/* ==================== TAB 4: SAVED ==================== */
+/* ==================== TAB 3: SAVED (Preserved Unchanged) ==================== */
 async function loadSavedItems() {
   const url = `/api/projects/${encodeURIComponent(state.projectId)}/saved?kind=${encodeURIComponent(state.savedKind)}&keyword=${encodeURIComponent(state.savedKeyword)}`;
   const data = await api(url);
@@ -804,7 +787,24 @@ function renderSavedDetail() {
   `;
 }
 
-/* ==================== TAB 5: SETTINGS ==================== */
+/* ==================== TAB 4: SETTINGS (User vs Admin Roles) ==================== */
+function selectSettingsSection(sec) {
+  $$("#settings-menu .side-menu-item").forEach((b) => b.classList.toggle("active", b.dataset.sec === sec));
+  $$(".settings-panel").forEach((p) => p.classList.toggle("active", p.id === `settings-sec-${sec}`));
+}
+
+function syncAdminUi() {
+  $$(".admin-only").forEach((el) => el.classList.toggle("hidden", !state.isAdmin));
+  $("#btn-open-admin-login").classList.toggle("hidden", state.isAdmin);
+  $("#admin-logged-bar").classList.toggle("hidden", !state.isAdmin);
+  if (!state.isAdmin) {
+    const activeSecBtn = $("#settings-menu .side-menu-item.active");
+    if (activeSecBtn && activeSecBtn.dataset.sec.startsWith("admin-")) {
+      selectSettingsSection("general");
+    }
+  }
+}
+
 async function loadSettings() {
   const [data, llmData] = await Promise.all([
     api(`/api/projects/${encodeURIComponent(state.projectId)}/settings`),
@@ -812,7 +812,14 @@ async function loadSettings() {
   ]);
   state.settingsData = data.settings;
   state.statusData = data.status;
-  state.llmConfig = llmData.llm_config || {};
+  state.isAdmin = Boolean(llmData.is_admin);
+  state.llmConfig = llmData.llm_config || null;
+  state.llmStatus = llmData.llm_status || {};
+  if (!state.isAdmin && state.adminToken) {
+    state.adminToken = "";
+    sessionStorage.removeItem("rfq_admin_token");
+  }
+  syncAdminUi();
   syncSettingsForm();
   renderSettingsRightRail();
 }
@@ -820,17 +827,22 @@ async function loadSettings() {
 function syncSettingsForm() {
   const s = state.settingsData;
   if (!s) return;
+  const curProj = state.projects.find((p) => p.id === state.projectId);
+  $("#user-general-project").textContent = curProj ? curProj.name : state.projectId;
+  $("#user-general-docs").textContent = String(state.docsData.total || 0);
+  $("#user-general-mode-text").textContent = (state.statusData && state.statusData.model_api) || "在线智能问答已就绪";
+  $("#user-default-qa-mode").value = state.userPreferredMode;
+  $("#qa-mode-select").value = state.userPreferredMode;
+
+  if (!state.isAdmin) return;
   const lc = state.llmConfig || {};
-  if ($("#cfg-llm-provider")) {
-    $("#cfg-llm-provider").value = lc.provider || "local";
-    $("#cfg-sf-model").value = lc.model || "";
-    $("#cfg-sf-key").value = "";
-    $("#cfg-sf-key-hint").textContent = lc.has_key
-      ? `已在本机保存密钥（${lc.key_mask}），留空即可保持不变；新输入将覆盖保存。`
-      : "尚未保存本机密钥；填写后点击“保存设置”即可永久保存在本机 AppData。";
-  }
-  $("#cfg-chat-model").value = s.chat_model || "GPT-4o（企业内网）";
-  $("#cfg-embed-model").value = s.embedding_model || "BAAI/bge-small-zh-v1.5（本地离线）";
+  $("#cfg-llm-provider").value = lc.provider || "local";
+  $("#cfg-sf-model").value = lc.model || "";
+  $("#cfg-sf-key").value = "";
+  $("#cfg-sf-key-hint").textContent = lc.has_key
+    ? `已在本机保存密钥（${lc.key_mask}），留空即可保持不变；新输入将覆盖保存。`
+    : "尚未保存本机密钥；填写后点击“保存管理员配置”即可永久保存在本机 AppData。";
+  $("#cfg-default-online").checked = lc.default_online_enabled !== false;
   $("#cfg-retrieval-mode").value = s.retrieval_mode || "混合检索（语义 + 关键词）";
   const thr = Number(s.similarity_threshold ?? 0.62).toFixed(2);
   $("#cfg-threshold").value = thr;
@@ -843,10 +855,8 @@ function syncSettingsForm() {
   $("#cfg-chunk-overlap").value = s.chunk_overlap ?? 64;
 }
 
-function readSettingsFromForm() {
+function readAdminSettingsFromForm() {
   return {
-    chat_model: $("#cfg-chat-model").value,
-    embedding_model: $("#cfg-embed-model").value,
     retrieval_mode: $("#cfg-retrieval-mode").value,
     similarity_threshold: Number($("#cfg-threshold").value),
     top_k: Number($("#cfg-top-k").value),
@@ -858,28 +868,35 @@ function readSettingsFromForm() {
 }
 
 function renderSettingsRightRail() {
-  const s = readSettingsFromForm();
   const st = state.statusData || {};
-  $("#settings-summary-kv").innerHTML = `
-    <div class="kv-row"><dt>回答模型</dt><dd>${esc(s.chat_model)}</dd></div>
-    <div class="kv-row"><dt>向量模型</dt><dd>${esc(s.embedding_model)}</dd></div>
-    <div class="kv-row"><dt>检索方式</dt><dd>${esc(s.retrieval_mode)}</dd></div>
-    <div class="kv-row"><dt>相似度阈值</dt><dd>${Number(s.similarity_threshold).toFixed(2)}</dd></div>
-    <div class="kv-row"><dt>最大候选数</dt><dd>${s.top_k}</dd></div>
-    <div class="kv-row"><dt>启用 OCR</dt><dd>${s.ocr_enabled ? "已启用" : "已关闭"}</dd></div>
-    <div class="kv-row"><dt>数据路径</dt><dd>${esc($("#cfg-data-path").value)}</dd></div>
-  `;
+  const ocrOn = state.isAdmin ? $("#cfg-ocr").checked : Boolean((state.settingsData || {}).ocr_enabled);
+  if (state.isAdmin) {
+    const s = readAdminSettingsFromForm();
+    const lc = state.llmConfig || {};
+    $("#settings-summary-kv").innerHTML = `
+      <div class="kv-row"><dt>服务商</dt><dd>${esc($("#cfg-llm-provider").value)}</dd></div>
+      <div class="kv-row"><dt>模型 ID</dt><dd>${esc($("#cfg-sf-model").value || lc.model || "未设置")}</dd></div>
+      <div class="kv-row"><dt>检索方式</dt><dd>${esc(s.retrieval_mode)}</dd></div>
+      <div class="kv-row"><dt>相似度阈值</dt><dd>${Number(s.similarity_threshold).toFixed(2)}</dd></div>
+      <div class="kv-row"><dt>最大候选数</dt><dd>${s.top_k}</dd></div>
+      <div class="kv-row"><dt>启用 OCR</dt><dd>${s.ocr_enabled ? "已启用" : "已关闭"}</dd></div>
+      <div class="kv-row"><dt>数据路径</dt><dd>${esc($("#cfg-data-path").value)}</dd></div>
+    `;
+  }
+  const ocrReady = ocrOn && !String(st.ocr_service || "").includes("未安装") && !String(st.ocr_service || "").includes("关闭");
+  const modelReady = !String(st.model_api || "").includes("失败") && !String(st.model_api || "").includes("未配置");
   $("#settings-status-list").innerHTML = `
-    <li><span class="st-label">模型接口</span><span class="st-val"><i class="st-dot"></i>${esc(st.model_api || "连接正常")}</span></li>
-    <li><span class="st-label">向量服务</span><span class="st-val"><i class="st-dot"></i>${esc(st.vector_service || "连接正常")}</span></li>
+    <li><span class="st-label">模型接口</span><span class="st-val"><i class="st-dot ${modelReady ? "" : "off"}"></i>${esc(st.model_api || "就绪")}</span></li>
+    <li><span class="st-label">向量服务</span><span class="st-val"><i class="st-dot"></i>${esc(st.vector_service || "就绪")}</span></li>
     <li><span class="st-label">索引服务</span><span class="st-val"><i class="st-dot"></i>${esc(st.index_service || "运行中")}</span></li>
-    <li><span class="st-label">OCR 服务</span><span class="st-val"><i class="st-dot ${s.ocr_enabled ? "" : "off"}"></i>${esc(st.ocr_service || "状态未查询")}</span></li>
+    <li><span class="st-label">OCR 服务</span><span class="st-val"><i class="st-dot ${ocrReady ? "" : "off"}"></i>${esc(st.ocr_service || "状态未查询")}</span></li>
   `;
   $("#settings-updated-at").textContent = `最近更新：${st.updated_at || "-"}`;
 }
 
-async function saveSettings() {
-  if ($("#cfg-llm-provider")) {
+async function saveAdminSettings() {
+  if (!state.isAdmin) return showToast("请先登录管理员");
+  try {
     const llmRes = await api("/api/llm-config", {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
@@ -887,21 +904,26 @@ async function saveSettings() {
         provider: $("#cfg-llm-provider").value,
         model: $("#cfg-sf-model").value.trim(),
         api_key: $("#cfg-sf-key").value.trim(),
+        default_online_enabled: $("#cfg-default-online").checked,
       }),
     });
     state.llmConfig = llmRes.llm_config || {};
+    state.llmStatus = llmRes.llm_status || {};
+
+    const payload = readAdminSettingsFromForm();
+    const data = await api(`/api/projects/${encodeURIComponent(state.projectId)}/settings`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    state.settingsData = data.settings;
+    state.statusData = data.status;
+    syncSettingsForm();
+    renderSettingsRightRail();
+    showToast("管理员配置与本机 API 密钥已长期保存");
+  } catch (err) {
+    showToast(err.message);
   }
-  const payload = readSettingsFromForm();
-  const data = await api(`/api/projects/${encodeURIComponent(state.projectId)}/settings`, {
-    method: "PUT",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-  });
-  state.settingsData = data.settings;
-  state.statusData = data.status;
-  syncSettingsForm();
-  renderSettingsRightRail();
-  showToast("项目设置与本机 API 配置已长期保存");
 }
 
 async function triggerBackup() {
@@ -913,6 +935,8 @@ async function triggerBackup() {
 
 /* ==================== EVENT WIRING ==================== */
 function bindEvents() {
+  initResizers();
+
   // Top nav tabs
   $$(".nav-tab").forEach((btn) => {
     btn.addEventListener("click", () => {
@@ -963,11 +987,29 @@ function bindEvents() {
     }
   });
 
-  // QA interactions
+  // QA right segmented switch & folder controls
+  $$("#view-qa .seg-tab").forEach((btn) => {
+    btn.addEventListener("click", () => setQaRightTab(btn.dataset.qaRight));
+  });
+  $("#btn-toggle-all-folders").addEventListener("click", () => {
+    const nonEmpty = (state.docsData.tree || []).filter((g) => g.count > 0);
+    const allCollapsed = nonEmpty.length > 0 && nonEmpty.every((g) => state.collapsedFolders.has(g.name));
+    if (allCollapsed) {
+      state.collapsedFolders.clear();
+    } else {
+      (state.docsData.tree || []).forEach((g) => state.collapsedFolders.add(g.name));
+    }
+    $$("#qa-doc-tree .tree-folder").forEach((el) => {
+      el.classList.toggle("collapsed", state.collapsedFolders.has(el.dataset.folder));
+    });
+    updateToggleAllFoldersLabel();
+  });
   $("#qa-file-search").addEventListener("input", (e) => {
     state.qaSearch = e.target.value;
-    renderDocTrees();
+    renderQaDocTree();
   });
+
+  // QA chat actions
   $("#btn-send-qa").addEventListener("click", handleSendQuestion);
   $("#qa-input").addEventListener("keydown", (e) => {
     if (e.key === "Enter") handleSendQuestion();
@@ -996,7 +1038,7 @@ function bindEvents() {
   // Docs interactions
   $("#docs-file-search").addEventListener("input", (e) => {
     state.docsSearch = e.target.value;
-    renderDocTrees();
+    renderDocsTable();
   });
   $("#btn-refresh-docs").addEventListener("click", async () => {
     await loadDocuments();
@@ -1054,50 +1096,7 @@ function bindEvents() {
     showToast("已完成重新解析与索引更新");
   });
 
-  // Compare interactions
-  $("#compare-left-select").addEventListener("change", (e) => {
-    state.compareLeftId = e.target.value;
-    runCompare();
-  });
-  $("#compare-right-select").addEventListener("change", (e) => {
-    state.compareRightId = e.target.value;
-    runCompare();
-  });
-  $("#btn-swap-compare").addEventListener("click", () => {
-    const tmp = state.compareLeftId;
-    state.compareLeftId = state.compareRightId;
-    state.compareRightId = tmp;
-    $("#compare-left-select").value = state.compareLeftId;
-    $("#compare-right-select").value = state.compareRightId;
-    runCompare();
-  });
-  $("#btn-run-compare").addEventListener("click", () => {
-    state.compareKeyword = $("#compare-kw-top").value.trim() || $("#compare-kw-left").value.trim();
-    runCompare();
-  });
-  $("#compare-kw-left").addEventListener("input", (e) => {
-    state.compareKeyword = e.target.value;
-    $("#compare-kw-top").value = e.target.value;
-  });
-  $("#compare-kw-left").addEventListener("keydown", (e) => { if (e.key === "Enter") runCompare(); });
-  $("#compare-kw-top").addEventListener("keydown", (e) => {
-    if (e.key === "Enter") {
-      state.compareKeyword = e.target.value;
-      $("#compare-kw-left").value = e.target.value;
-      runCompare();
-    }
-  });
-  $$("#compare-kw-tags .kw-tag").forEach((tag) => {
-    tag.addEventListener("click", () => {
-      const kw = tag.dataset.kw;
-      state.compareKeyword = kw;
-      $("#compare-kw-left").value = kw;
-      $("#compare-kw-top").value = kw;
-      runCompare();
-    });
-  });
-
-  // Saved interactions
+  // Saved interactions (preserved)
   $$("#saved-kind-menu .side-menu-item").forEach((btn) => {
     btn.addEventListener("click", () => {
       state.savedKind = btn.dataset.kind;
@@ -1134,37 +1133,98 @@ function bindEvents() {
     }
   });
 
-  // Settings interactions
+  // Settings & Dual-Role Admin interactions
   $$("#settings-menu .side-menu-item").forEach((btn) => {
-    btn.addEventListener("click", () => {
-      const sec = btn.dataset.sec;
-      $$("#settings-menu .side-menu-item").forEach((b) => b.classList.toggle("active", b === btn));
-      $$(".settings-panel").forEach((p) => p.classList.toggle("active", p.id === `settings-sec-${sec}`));
-    });
+    btn.addEventListener("click", () => selectSettingsSection(btn.dataset.sec));
   });
+  $("#user-default-qa-mode").addEventListener("change", (e) => {
+    state.userPreferredMode = e.target.value;
+    localStorage.setItem("rfq_default_qa_mode", state.userPreferredMode);
+    $("#qa-mode-select").value = state.userPreferredMode;
+    showToast(`已将默认问答模式设为：${state.userPreferredMode}`);
+  });
+
+  $("#btn-open-admin-login").addEventListener("click", () => {
+    $("#admin-pin-input").value = "";
+    $("#modal-admin-login").classList.remove("hidden");
+    setTimeout(() => $("#admin-pin-input").focus(), 40);
+  });
+
+  const submitAdminLogin = async () => {
+    const pin = $("#admin-pin-input").value;
+    if (!pin.trim()) return showToast("请输入管理员口令");
+    try {
+      const res = await api("/api/admin/login", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ pin }),
+      });
+      state.adminToken = res.token;
+      sessionStorage.setItem("rfq_admin_token", res.token);
+      $("#modal-admin-login").classList.add("hidden");
+      await loadSettings();
+      selectSettingsSection("admin-model");
+      showToast("已进入管理员配置模式");
+    } catch (err) {
+      showToast(err.message);
+    }
+  };
+  $("#btn-confirm-admin-login").addEventListener("click", submitAdminLogin);
+  $("#admin-pin-input").addEventListener("keydown", (e) => {
+    if (e.key === "Enter") submitAdminLogin();
+  });
+
+  $("#btn-admin-logout").addEventListener("click", async () => {
+    try {
+      await api("/api/admin/logout", { method: "POST" });
+    } catch {}
+    state.adminToken = "";
+    state.isAdmin = false;
+    sessionStorage.removeItem("rfq_admin_token");
+    await loadSettings();
+    showToast("已退出管理员模式");
+  });
+
+  $("#btn-change-pin").addEventListener("click", async () => {
+    const current_pin = $("#pin-current").value;
+    const new_pin = $("#pin-new").value;
+    try {
+      await api("/api/admin/pin", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ current_pin, new_pin }),
+      });
+      $("#pin-current").value = "";
+      $("#pin-new").value = "";
+      showToast("管理员口令已更新");
+    } catch (err) {
+      showToast(err.message);
+    }
+  });
+
   $("#cfg-threshold").addEventListener("input", (e) => {
     $("#cfg-threshold-val").value = Number(e.target.value).toFixed(2);
     renderSettingsRightRail();
   });
-  ["#cfg-chat-model", "#cfg-embed-model", "#cfg-retrieval-mode", "#cfg-top-k", "#cfg-ocr"].forEach((sel) => {
+  ["#cfg-llm-provider", "#cfg-sf-model", "#cfg-retrieval-mode", "#cfg-top-k", "#cfg-ocr", "#cfg-online-answers"].forEach((sel) => {
     $(sel).addEventListener("change", renderSettingsRightRail);
   });
-  $("#btn-save-settings").addEventListener("click", saveSettings);
-  $("#btn-save-settings-2").addEventListener("click", saveSettings);
+  $("#btn-save-settings").addEventListener("click", saveAdminSettings);
+  $("#btn-save-settings-2").addEventListener("click", saveAdminSettings);
   $("#btn-reset-settings").addEventListener("click", () => {
     state.settingsData = {
       ...state.settingsData,
-      chat_model: "GPT-4o（企业内网）",
-      embedding_model: "BAAI/bge-small-zh-v1.5（本地离线）",
       retrieval_mode: "混合检索（语义 + 关键词）",
       similarity_threshold: 0.62,
       top_k: 10,
       ocr_enabled: true,
-      online_answers_enabled: false,
+      online_answers_enabled: true,
+      chunk_size: 480,
+      chunk_overlap: 64,
     };
     syncSettingsForm();
     renderSettingsRightRail();
-    showToast("已恢复默认参数（点击“保存设置”生效）");
+    showToast("已恢复推荐参数（点击“保存管理员配置”生效）");
   });
   $("#btn-copy-path").addEventListener("click", async () => {
     try {

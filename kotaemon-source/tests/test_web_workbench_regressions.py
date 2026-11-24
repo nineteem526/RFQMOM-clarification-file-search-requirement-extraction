@@ -24,6 +24,7 @@ class WorkbenchRegressions(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
+        os.environ["RFQ_LOCAL_LLM_CONFIG"] = str(self.root / "local_llm_config.json")
 
     def test_failed_upload_and_empty_project_return_no_evidence(self):
         with TestClient(create_web_app(self.root)) as client:

@@ -159,7 +159,10 @@ class SiliconFlowTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             cfg_file = Path(tmp) / "local_llm_config.json"
-            with patch.dict(os.environ, {"RFQ_LOCAL_LLM_CONFIG": str(cfg_file)}, clear=True):
+            with patch.dict(os.environ, {
+                "RFQ_LOCAL_LLM_CONFIG": str(cfg_file),
+                "RFQ_RUNTIME_HOME": str(tmp),
+            }, clear=True):
                 saved = rag_engine.save_local_llm_config(
                     "siliconflow", "deepseek-ai/DeepSeek-V4.1-Flash", "sk-demo1234567890"
                 )
@@ -173,6 +176,70 @@ class SiliconFlowTests(unittest.TestCase):
                 saved2 = rag_engine.save_local_llm_config("siliconflow", "deepseek-ai/DeepSeek-V3", "")
                 self.assertTrue(saved2["has_key"])
                 self.assertEqual(rag_engine.llm_config_status()["model"], "deepseek-ai/DeepSeek-V3")
+
+    def test_admin_pin_role_isolation_and_new_project_auto_online(self):
+        import tempfile
+        from pathlib import Path
+        from fastapi.testclient import TestClient
+        from web_app import create_web_app
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg_file = root / "local_llm_config.json"
+            with patch.dict(os.environ, {
+                "RFQ_LOCAL_LLM_CONFIG": str(cfg_file),
+                "RFQ_RUNTIME_HOME": str(root),
+            }, clear=True):
+                with TestClient(create_web_app(root)) as client:
+                    # 1. Anonymous user sees no admin credentials/model details and cannot PUT /api/llm-config
+                    anon_cfg = client.get("/api/llm-config").raise_for_status().json()
+                    self.assertFalse(anon_cfg["is_admin"])
+                    self.assertNotIn("llm_config", anon_cfg)
+                    put_denied = client.put("/api/llm-config", json={"provider": "siliconflow"})
+                    self.assertEqual(put_denied.status_code, 403)
+
+                    # 2. Wrong PIN rejected, default PIN unlocks admin session
+                    bad_login = client.post("/api/admin/login", json={"pin": "wrong"})
+                    self.assertEqual(bad_login.status_code, 403)
+                    login = client.post("/api/admin/login", json={"pin": "admin123"}).raise_for_status().json()
+                    headers = {"X-Admin-Token": login["token"]}
+
+                    # 3. Admin saves SiliconFlow config + default_online_enabled=True
+                    saved = client.put(
+                        "/api/llm-config",
+                        headers=headers,
+                        json={
+                            "provider": "siliconflow",
+                            "model": "deepseek-ai/DeepSeek-V4.1-Flash",
+                            "api_key": "sk-admin1234567890",
+                            "default_online_enabled": True,
+                        },
+                    ).raise_for_status().json()
+                    self.assertTrue(saved["is_admin"])
+                    self.assertTrue(saved["llm_config"]["has_key"])
+                    self.assertEqual(saved["llm_config"]["model"], "deepseek-ai/DeepSeek-V4.1-Flash")
+
+                    # 4. Newly created project inherits online_answers_enabled=True automatically
+                    client.post("/api/projects", json={"id": "p-auto", "name": "Auto Project"}).raise_for_status()
+                    proj_cfg = client.get("/api/projects/p-auto/settings").raise_for_status().json()
+                    self.assertTrue(proj_cfg["settings"]["online_answers_enabled"])
+
+                    # 5. Admin can update PIN, old PIN stops working, new PIN works
+                    client.put("/api/admin/pin", headers=headers, json={"current_pin": "admin123", "new_pin": "6789"}).raise_for_status()
+                    self.assertEqual(client.post("/api/admin/login", json={"pin": "admin123"}).status_code, 403)
+                    self.assertEqual(client.post("/api/admin/login", json={"pin": "6789"}).status_code, 200)
+
+                    # 6. Logout revokes token
+                    client.post("/api/admin/logout", headers=headers).raise_for_status()
+                    self.assertEqual(client.put("/api/llm-config", headers=headers, json={"provider": "local"}).status_code, 403)
+
+    def test_concise_fallback_omits_redundant_basis_and_summary_table(self):
+        hits = [{"id": "1", "doc_id": "1", "doc_name": "manual.pdf", "page": 2,
+                 "content": "Rated voltage: D.C. 18 V", "semantic_score": 0.9}]
+        ans = rag_engine.generate_structured_answer("What is the rated voltage?", hits, "demo", {})
+        self.assertEqual(ans["basis"], [])
+        self.assertEqual(ans["table"], [])
+        self.assertTrue(ans["citations"])
 
 
 if __name__ == "__main__":

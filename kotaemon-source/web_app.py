@@ -18,12 +18,13 @@ import json
 import os
 from pathlib import Path
 import re
+import secrets
 import shutil
 import sqlite3
 import sys
 import uuid
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 import uvicorn
@@ -36,10 +37,13 @@ from rag_engine import (
     generate_structured_answer,
     hybrid_search,
     llm_config_status,
+    load_local_llm_config,
     masked_local_llm_config,
     pack_vector,
     save_local_llm_config,
     split_text_with_overlap,
+    update_admin_pin,
+    verify_admin_pin,
 )
 
 DEFAULT_SETTINGS = {
@@ -62,7 +66,7 @@ DEFAULT_FOLDERS = [
     "会议纪要",
     "其他资料",
 ]
-QUERY_CACHE_FORMAT = 2
+QUERY_CACHE_FORMAT = 3
 QUERY_MODES = {"快速问答": 0, "扩展候选检索": 12, "更多候选检索": 20}
 LEGACY_QUERY_MODES = {"主题逐文件检查": "扩展候选检索", "深度全文检查": "更多候选检索"}
 CHUNKS_FOR_DISPLAY = (
@@ -389,12 +393,23 @@ class ProjectStore:
     def get_settings(self) -> dict:
         cfg = dict(DEFAULT_SETTINGS)
         cfg["data_path"] = str(self.root)
+        has_explicit_online = False
         with self._conn() as conn:
             for row in conn.execute("SELECT key, value FROM settings WHERE key <> '_revision'"):
+                if row["key"] == "online_answers_enabled":
+                    has_explicit_online = True
                 try:
                     cfg[row["key"]] = json.loads(row["value"])
                 except Exception:
                     cfg[row["key"]] = row["value"]
+        if not has_explicit_online:
+            local_cfg = load_local_llm_config()
+            if (
+                local_cfg.get("provider") in {"siliconflow", "company-azure"}
+                and local_cfg.get("default_online_enabled", True)
+                and llm_config_status().get("configured")
+            ):
+                cfg["online_answers_enabled"] = True
         return cfg
 
     def get_revision(self) -> int:
@@ -1267,7 +1282,7 @@ def create_web_app(runtime_root: Path | None = None) -> FastAPI:
             headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quote(filename)}"},
         )
 
-    def _build_runtime_status(store: ProjectStore, cfg: dict) -> dict:
+    def _build_runtime_status(store: ProjectStore, cfg: dict, is_admin: bool = False) -> dict:
         docs = store.list_documents()
         with store._conn() as conn:
             chunk_cnt, vec_cnt = conn.execute(
@@ -1303,45 +1318,107 @@ def create_web_app(runtime_root: Path | None = None) -> FastAPI:
                     pass
             if not last_call_note:
                 last_call_note = "（尚未在当前项目实测调用）"
+        if cfg.get("online_answers_enabled") is True and llm.get("configured"):
+            model_status = (llm["status_text"] if is_admin else "在线智能问答已就绪") + last_call_note
+        elif cfg.get("online_answers_enabled") is True:
+            model_status = llm["status_text"] if is_admin else "在线模型未配置（本地检索模式）"
+        else:
+            model_status = "本项目使用本地检索"
         return {
-            "model_api": (llm["status_text"] + last_call_note) if cfg.get("online_answers_enabled") is True else "本项目使用本地检索",
+            "model_api": model_status,
             "vector_service": "本地 BGE 512维就绪" if emb.get("ok") else "向量模型未就绪",
             "index_service": f"运行中（文档 {len(docs)} 篇 · 向量块 {vec_cnt}/{chunk_cnt}）",
             "ocr_service": ocr_status,
             "updated_at": _now_str(),
         }
 
+    admin_tokens: set[str] = set()
+
+    def _is_admin(token: str | None) -> bool:
+        return bool(token and token in admin_tokens)
+
+    @api.get("/api/admin/status")
+    def get_admin_status(x_admin_token: str | None = Header(default=None)):
+        local_cfg = load_local_llm_config()
+        return {
+            "is_admin": _is_admin(x_admin_token),
+            "has_custom_pin": bool(local_cfg.get("admin_pin_hash")),
+        }
+
+    @api.post("/api/admin/login")
+    def admin_login(payload: dict):
+        pin = str(payload.get("pin", ""))
+        if not verify_admin_pin(pin):
+            raise HTTPException(403, "管理员口令错误。")
+        token = secrets.token_urlsafe(32)
+        admin_tokens.add(token)
+        return {"token": token, "is_admin": True}
+
+    @api.post("/api/admin/logout")
+    def admin_logout(x_admin_token: str | None = Header(default=None)):
+        if x_admin_token:
+            admin_tokens.discard(x_admin_token)
+        return {"ok": True, "is_admin": False}
+
+    @api.put("/api/admin/pin")
+    def change_admin_pin(payload: dict, x_admin_token: str | None = Header(default=None)):
+        if not _is_admin(x_admin_token):
+            raise HTTPException(403, "需要管理员权限。")
+        try:
+            update_admin_pin(
+                str(payload.get("current_pin", "")),
+                str(payload.get("new_pin", "")),
+            )
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from None
+        return {"ok": True}
+
     @api.get("/api/llm-config")
-    def get_llm_config():
-        return {"llm_config": masked_local_llm_config(), "llm_status": llm_config_status()}
+    def get_llm_config(x_admin_token: str | None = Header(default=None)):
+        st = llm_config_status()
+        if not _is_admin(x_admin_token):
+            return {
+                "is_admin": False,
+                "llm_status": {
+                    "configured": bool(st.get("configured")),
+                    "status_text": "在线模型已就绪" if st.get("configured") else "本地检索模式",
+                },
+            }
+        return {"is_admin": True, "llm_config": masked_local_llm_config(), "llm_status": st}
 
     @api.put("/api/llm-config")
-    def put_llm_config(payload: dict):
+    def put_llm_config(payload: dict, x_admin_token: str | None = Header(default=None)):
+        if not _is_admin(x_admin_token):
+            raise HTTPException(403, "需要管理员权限。")
         try:
+            default_online = payload.get("default_online_enabled")
             saved = save_local_llm_config(
                 provider=str(payload.get("provider", "")),
                 model=str(payload.get("model", "")),
                 api_key=str(payload.get("api_key", "")),
                 clear_key=bool(payload.get("clear_key", False)),
+                default_online_enabled=bool(default_online) if default_online is not None else None,
             )
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from None
-        return {"llm_config": saved, "llm_status": llm_config_status()}
+        return {"is_admin": True, "llm_config": saved, "llm_status": llm_config_status()}
 
     @api.get("/api/projects/{project_id}/settings")
-    def get_settings(project_id: str):
+    def get_settings(project_id: str, x_admin_token: str | None = Header(default=None)):
         store = get_store(project_id)
         cfg = store.get_settings()
-        return {"settings": cfg, "status": _build_runtime_status(store, cfg)}
+        is_admin = _is_admin(x_admin_token)
+        return {"settings": cfg, "status": _build_runtime_status(store, cfg, is_admin=is_admin), "is_admin": is_admin}
 
     @api.put("/api/projects/{project_id}/settings")
-    def put_settings(project_id: str, payload: dict):
+    def put_settings(project_id: str, payload: dict, x_admin_token: str | None = Header(default=None)):
         store = get_store(project_id)
+        is_admin = _is_admin(x_admin_token)
         try:
             updated = store.update_settings(payload)
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from None
-        return {"settings": updated, "status": _build_runtime_status(store, updated)}
+        return {"settings": updated, "status": _build_runtime_status(store, updated, is_admin=is_admin), "is_admin": is_admin}
 
     @api.post("/api/projects/{project_id}/backup")
     def backup_project(project_id: str):
