@@ -1,0 +1,559 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>工程项目知识助手</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <div class="app-shell">
+    <!-- Top Unified Navigation Header -->
+    <header class="topbar">
+      <div class="topbar-left">
+        <div class="brand-title">工程项目知识助手</div>
+        <nav class="topnav" id="topnav" aria-label="主导航">
+          <button class="nav-tab active" data-tab="qa">问答</button>
+          <button class="nav-tab" data-tab="docs">资料</button>
+          <button class="nav-tab" data-tab="compare">原文对照</button>
+          <button class="nav-tab" data-tab="saved">已保存</button>
+          <button class="nav-tab" data-tab="settings">设置</button>
+        </nav>
+      </div>
+      <div class="topbar-right">
+        <div class="topbar-divider"></div>
+        <div class="project-switcher" id="project-switcher">
+          <button class="project-trigger" id="project-trigger" type="button" aria-haspopup="listbox" aria-expanded="false">
+            <span class="project-label">项目：<strong id="current-project-name">RFQ 演示项目</strong></span>
+            <svg class="chevron-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m6 9 6 6 6-6"/></svg>
+          </button>
+          <div class="project-dropdown hidden" id="project-dropdown" role="listbox">
+            <div class="project-dropdown-header">切换项目数据库（各项目独立存储）</div>
+            <div class="project-list" id="project-list"></div>
+            <div class="project-dropdown-footer">
+              <button class="btn-new-project" id="open-new-project-modal" type="button">+ 新建独立项目数据库</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </header>
+
+    <!-- Main Workspace Body -->
+    <main class="workspace-body">
+      <!-- ==================== TAB 1: 问答 ==================== -->
+      <section class="tab-view active" id="view-qa">
+        <div class="three-col-layout">
+          <!-- Left: 项目资料 Tree -->
+          <aside class="col-left">
+            <div class="rail-header">
+              <h2>项目资料</h2>
+              <div class="rail-sub" id="qa-doc-count">0 份文件</div>
+            </div>
+            <div class="search-box">
+              <svg class="search-icon" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>
+              <input type="text" id="qa-file-search" placeholder="搜索文件" autocomplete="off" />
+            </div>
+            <div class="doc-tree-scroll" id="qa-doc-tree"></div>
+            <div class="rail-footer" id="qa-rail-footer">资料已索引 · 最近更新</div>
+          </aside>
+
+          <!-- Center: 项目问答 -->
+          <section class="col-center qa-center">
+            <div class="center-header">
+              <h2>项目问答</h2>
+              <button class="btn-ghost-sm" id="btn-clear-chat" type="button" title="开始新的空白对话">清空对话</button>
+            </div>
+            <div class="chat-feed" id="chat-feed"></div>
+            <div class="chat-composer-wrap">
+              <div class="composer-row">
+                <input type="text" id="qa-input" class="composer-input" placeholder="继续询问项目文档..." autocomplete="off" />
+                <button class="btn-primary" id="btn-send-qa" type="button">发送</button>
+              </div>
+              <div class="composer-meta">
+                <select id="qa-mode-select" class="inline-select" aria-label="问答模式">
+                  <option value="快速问答">快速问答</option>
+                  <option value="主题逐文件检查">主题逐文件检查</option>
+                  <option value="深度全文检查">深度全文检查</option>
+                </select>
+                <span class="meta-sep">|</span>
+                <span class="meta-hint">回答基于检索片段，可能不完整。</span>
+              </div>
+            </div>
+          </section>
+
+          <!-- Right: 原文预览 -->
+          <aside class="col-right qa-right">
+            <div class="rail-header">
+              <h2>原文预览</h2>
+            </div>
+            <div class="citation-tabs" id="qa-citation-list"></div>
+            <div class="preview-card" id="qa-preview-card">
+              <div class="preview-card-head">
+                <div>
+                  <div class="preview-doc-name" id="qa-preview-name">暂无预览</div>
+                  <div class="preview-doc-loc" id="qa-preview-loc">提出问题或点击左侧文件查看原文</div>
+                </div>
+                <div class="pager-controls">
+                  <button class="pager-btn" id="qa-prev-page" type="button" aria-label="上一页">&lt;</button>
+                  <span class="pager-indicator" id="qa-page-indicator">- / -</span>
+                  <button class="pager-btn" id="qa-next-page" type="button" aria-label="下一页">&gt;</button>
+                </div>
+              </div>
+              <div class="preview-card-body" id="qa-preview-body"></div>
+            </div>
+            <div class="preview-footer">
+              <a class="link-primary" id="qa-open-full-file" href="#" target="_blank" rel="noopener">查看完整文件</a>
+            </div>
+          </aside>
+        </div>
+      </section>
+
+      <!-- ==================== TAB 2: 资料 ==================== -->
+      <section class="tab-view" id="view-docs">
+        <div class="three-col-layout">
+          <!-- Left: 项目资料 Tree -->
+          <aside class="col-left">
+            <div class="rail-header">
+              <h2>项目资料</h2>
+              <div class="rail-sub" id="docs-doc-count">0 份文件</div>
+            </div>
+            <div class="search-box">
+              <svg class="search-icon" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>
+              <input type="text" id="docs-file-search" placeholder="搜索文件" autocomplete="off" />
+            </div>
+            <div class="doc-tree-scroll" id="docs-doc-tree"></div>
+            <div class="rail-footer" id="docs-rail-footer">资料已索引 · 最近更新</div>
+          </aside>
+
+          <!-- Center: File Table -->
+          <section class="col-center docs-center">
+            <div class="docs-toolbar">
+              <div>
+                <h2 id="docs-folder-title">全部资料</h2>
+                <div class="rail-sub" id="docs-folder-count">共 0 份文件</div>
+              </div>
+              <div class="docs-actions">
+                <button class="btn-primary" id="btn-open-upload" type="button">上传资料</button>
+                <button class="btn-secondary" id="btn-open-folder" type="button">新建文件夹</button>
+                <button class="btn-secondary" id="btn-refresh-docs" type="button">刷新</button>
+              </div>
+            </div>
+            <div class="table-container">
+              <table class="data-table">
+                <thead>
+                  <tr>
+                    <th>文件名</th>
+                    <th style="width: 78px;">类型</th>
+                    <th style="width: 82px;">版本</th>
+                    <th style="width: 156px;">更新时间 ⌄</th>
+                    <th style="width: 84px;">状态</th>
+                  </tr>
+                </thead>
+                <tbody id="docs-table-body"></tbody>
+              </table>
+            </div>
+          </section>
+
+          <!-- Right: 文件详情 -->
+          <aside class="col-right docs-right">
+            <div class="rail-header">
+              <h2>文件详情</h2>
+            </div>
+            <div class="detail-file-bar">
+              <div class="detail-file-title">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/></svg>
+                <span id="detail-doc-name">-</span>
+              </div>
+              <div class="detail-file-links">
+                <a class="link-primary" id="detail-open-source" href="#" target="_blank" rel="noopener">查看原文</a>
+                <button class="link-btn" id="btn-reparse-doc" type="button">重新解析</button>
+              </div>
+            </div>
+            <dl class="kv-grid" id="detail-kv-grid"></dl>
+            <div class="section-subtitle">内容预览</div>
+            <div class="preview-card preview-card-compact">
+              <div class="preview-card-body" id="detail-preview-body"></div>
+            </div>
+          </aside>
+        </div>
+      </section>
+
+      <!-- ==================== TAB 3: 原文对照 ==================== -->
+      <section class="tab-view" id="view-compare">
+        <div class="three-col-layout">
+          <!-- Left: 对照资料 & 对照范围 -->
+          <aside class="col-left">
+            <div class="rail-header">
+              <h2>对照资料</h2>
+              <div class="rail-sub">已选 2 个文件</div>
+            </div>
+            <div class="selected-doc-pills" id="compare-selected-pills"></div>
+
+            <div class="rail-section-title">对照范围</div>
+            <div class="filter-group">
+              <div class="filter-group-head">⌄ 按章节</div>
+              <div class="checkbox-list" id="compare-section-checks"></div>
+            </div>
+            <div class="filter-group">
+              <div class="filter-group-head">⌄ 按关键词</div>
+              <div class="search-box search-box-sm">
+                <svg class="search-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>
+                <input type="text" id="compare-kw-left" placeholder="输入关键词，如“防护等级”" autocomplete="off" />
+              </div>
+              <div class="keyword-tags" id="compare-kw-tags">
+                <button class="kw-tag" data-kw="防护等级">防护等级</button>
+                <button class="kw-tag" data-kw="协议">接口协议</button>
+                <button class="kw-tag" data-kw="测试">测试要求</button>
+                <button class="kw-tag" data-kw="控制柜">控制柜</button>
+              </div>
+            </div>
+          </aside>
+
+          <!-- Center: 原文对照双栏 -->
+          <section class="col-center compare-center">
+            <div class="center-header">
+              <h2>原文对照</h2>
+            </div>
+            <div class="compare-toolbar">
+              <span class="toolbar-label">文档版本：</span>
+              <select id="compare-left-select" class="form-select form-select-sm"></select>
+              <button class="icon-btn" id="btn-swap-compare" type="button" title="互换左右文档">⇄</button>
+              <select id="compare-right-select" class="form-select form-select-sm"></select>
+              <div class="search-box search-box-inline">
+                <svg class="search-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>
+                <input type="text" id="compare-kw-top" placeholder="在对照内容中搜索关键词" autocomplete="off" />
+              </div>
+              <button class="btn-primary btn-sm" id="btn-run-compare" type="button">对照</button>
+            </div>
+            <div class="compare-board-scroll" id="compare-board"></div>
+          </section>
+
+          <!-- Right: 差异摘要 -->
+          <aside class="col-right compare-right">
+            <div class="rail-header">
+              <h2>差异摘要</h2>
+              <div class="rail-sub" id="compare-diff-count">共 0 项主要差异</div>
+            </div>
+            <div class="diff-summary-list" id="compare-summary-list"></div>
+            <div class="conclusion-box" id="compare-conclusion-box">
+              <div class="blue-bar-title">对照结论</div>
+              <p id="compare-conclusion-text">请选择两个版本开始对照。</p>
+            </div>
+          </aside>
+        </div>
+      </section>
+
+      <!-- ==================== TAB 4: 已保存 ==================== -->
+      <section class="tab-view" id="view-saved">
+        <div class="three-col-layout">
+          <!-- Left: 已保存记录分类与筛选 -->
+          <aside class="col-left">
+            <div class="rail-header">
+              <h2>已保存记录</h2>
+              <div class="rail-sub" id="saved-total-sub">共 0 条</div>
+            </div>
+            <nav class="side-menu" id="saved-kind-menu">
+              <button class="side-menu-item active" data-kind="all"><span>全部结果</span><em id="cnt-all">(0)</em></button>
+              <button class="side-menu-item" data-kind="qa"><span>问答结果</span><em id="cnt-qa">(0)</em></button>
+              <button class="side-menu-item" data-kind="compare"><span>对照结果</span><em id="cnt-compare">(0)</em></button>
+              <button class="side-menu-item" data-kind="export"><span>导出记录</span><em id="cnt-export">(0)</em></button>
+            </nav>
+
+            <div class="rail-section-title">筛选</div>
+            <div class="filter-field">
+              <label>当前项目</label>
+              <input type="text" id="saved-project-readonly" class="form-input form-input-sm" readonly />
+            </div>
+            <div class="filter-field">
+              <label>关键词</label>
+              <div class="search-box search-box-sm">
+                <svg class="search-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>
+                <input type="text" id="saved-keyword-input" placeholder="搜索已保存内容" autocomplete="off" />
+              </div>
+            </div>
+          </aside>
+
+          <!-- Center: 已保存结果列表 -->
+          <section class="col-center saved-center">
+            <div class="center-header">
+              <div>
+                <h2>已保存结果</h2>
+                <div class="rail-sub" id="saved-list-count">共 0 条结果</div>
+              </div>
+              <span class="sort-label">按保存时间排序 ⌄</span>
+            </div>
+            <div class="saved-cards-scroll" id="saved-cards-list"></div>
+          </section>
+
+          <!-- Right: 已保存详情 -->
+          <aside class="col-right saved-right">
+            <div class="saved-detail-toolbar">
+              <h2>已保存详情</h2>
+              <div class="saved-detail-actions">
+                <button class="btn-secondary btn-xs" id="btn-export-xlsx" type="button">↓ 导出 XLSX</button>
+                <button class="btn-secondary btn-xs" id="btn-copy-saved" type="button">❐ 复制结果</button>
+                <button class="btn-secondary btn-xs" id="btn-goto-source" type="button">↗ 查看原文</button>
+              </div>
+            </div>
+            <div class="saved-detail-scroll" id="saved-detail-body"></div>
+          </aside>
+        </div>
+      </section>
+
+      <!-- ==================== TAB 5: 设置 ==================== -->
+      <section class="tab-view" id="view-settings">
+        <div class="three-col-layout">
+          <!-- Left: 设置菜单 -->
+          <aside class="col-left">
+            <div class="rail-header">
+              <h2>设置</h2>
+            </div>
+            <nav class="side-menu" id="settings-menu">
+              <button class="side-menu-item active" data-sec="model">模型与接口</button>
+              <button class="side-menu-item" data-sec="retrieval">检索参数</button>
+              <button class="side-menu-item" data-sec="parser">文档解析</button>
+              <button class="side-menu-item" data-sec="backup">数据与备份</button>
+              <button class="side-menu-item" data-sec="about">关于</button>
+            </nav>
+          </aside>
+
+          <!-- Center: 设置表单 -->
+          <section class="col-center settings-center">
+            <div class="settings-panel active" id="settings-sec-model">
+              <h2>模型与接口</h2>
+              <p class="settings-desc">配置用于当前项目问答和检索的模型与接口，支持对接企业自有模型或第三方服务。</p>
+              <div class="form-row">
+                <label class="form-label"><span class="req">*</span> 回答模型</label>
+                <div class="form-control">
+                  <select id="cfg-chat-model" class="form-select">
+                    <option value="GPT-4o（企业内网）">GPT-4o（企业内网）</option>
+                    <option value="Qwen2.5-72B（企业内网）">Qwen2.5-72B（企业内网）</option>
+                    <option value="DeepSeek-V3（企业内网）">DeepSeek-V3（企业内网）</option>
+                  </select>
+                  <div class="form-help">用于生成问答结果的语言模型，需具备较强的工程专业理解与指令遵循能力。</div>
+                </div>
+              </div>
+              <div class="form-row">
+                <label class="form-label"><span class="req">*</span> 向量模型</label>
+                <div class="form-control">
+                  <select id="cfg-embed-model" class="form-select">
+                    <option value="BAAI/bge-small-zh-v1.5（本地离线）">BAAI/bge-small-zh-v1.5（本地离线）</option>
+                    <option value="text-embedding-3-large（企业内网）">text-embedding-3-large（企业内网）</option>
+                  </select>
+                  <div class="form-help">用于将文档和问题编码为向量，影响检索的语义匹配效果。</div>
+                </div>
+              </div>
+              <div class="form-row">
+                <label class="form-label">检索方式</label>
+                <div class="form-control">
+                  <select id="cfg-retrieval-mode" class="form-select">
+                    <option value="混合检索（语义 + 关键词）">混合检索（语义 + 关键词）</option>
+                    <option value="语义向量检索">语义向量检索</option>
+                    <option value="精确关键词检索">精确关键词检索</option>
+                  </select>
+                  <div class="form-help">结合语义相似度和关键词匹配，提升工程文档的检索召回率与准确性。</div>
+                </div>
+              </div>
+              <div class="form-row">
+                <label class="form-label">相似度阈值</label>
+                <div class="form-control">
+                  <div class="slider-row">
+                    <input type="range" id="cfg-threshold" min="0.30" max="0.95" step="0.01" value="0.62" />
+                    <input type="text" id="cfg-threshold-val" class="slider-value-box" value="0.62" readonly />
+                  </div>
+                  <div class="form-help">仅返回相似度不低于该阈值的文档，取值范围 0.30 - 0.95。</div>
+                </div>
+              </div>
+              <div class="form-row">
+                <label class="form-label">最大候选数</label>
+                <div class="form-control">
+                  <select id="cfg-top-k" class="form-select">
+                    <option value="5">5</option>
+                    <option value="10">10</option>
+                    <option value="15">15</option>
+                    <option value="20">20</option>
+                    <option value="30">30</option>
+                  </select>
+                  <div class="form-help">每次检索返回的候选文档数量，范围 3 - 50。</div>
+                </div>
+              </div>
+              <div class="form-row">
+                <label class="form-label">是否启用 OCR</label>
+                <div class="form-control">
+                  <label class="toggle-switch">
+                    <input type="checkbox" id="cfg-ocr" checked />
+                    <span class="toggle-track"></span>
+                  </label>
+                  <div class="form-help">启用后，可对扫描件、图片类文档进行文字识别并纳入检索。</div>
+                </div>
+              </div>
+              <div class="form-row">
+                <label class="form-label">数据路径</label>
+                <div class="form-control">
+                  <div class="input-with-btn">
+                    <input type="text" id="cfg-data-path" class="form-input" readonly />
+                    <button class="btn-secondary" id="btn-copy-path" type="button">复制</button>
+                  </div>
+                  <div class="form-help">当前项目独立数据库、文档原件及索引存储目录（不同项目完全隔离）。</div>
+                </div>
+              </div>
+              <div class="settings-footer-actions">
+                <button class="btn-secondary" id="btn-reset-settings" type="button">恢复默认</button>
+                <button class="btn-primary" id="btn-save-settings" type="button">保存设置</button>
+              </div>
+            </div>
+
+            <div class="settings-panel" id="settings-sec-retrieval">
+              <h2>检索参数</h2>
+              <p class="settings-desc">微调当前项目库的切分粒度与混合检索召回策略（供后续 P1–P5 后端优化联动）。</p>
+              <div class="form-row">
+                <label class="form-label">分块大小 (Tokens)</label>
+                <div class="form-control">
+                  <input type="number" id="cfg-chunk-size" class="form-input" value="480" min="128" max="2048" />
+                  <div class="form-help">工程文档推荐 380–512 tokens，避免跨条目切断技术参数。</div>
+                </div>
+              </div>
+              <div class="form-row">
+                <label class="form-label">分块重叠 (Tokens)</label>
+                <div class="form-control">
+                  <input type="number" id="cfg-chunk-overlap" class="form-input" value="64" min="0" max="256" />
+                  <div class="form-help">相邻文本块保留重叠上下文，减少跨段条件漏召回。</div>
+                </div>
+              </div>
+              <div class="settings-footer-actions">
+                <button class="btn-primary" id="btn-save-settings-2" type="button">保存设置</button>
+              </div>
+            </div>
+
+            <div class="settings-panel" id="settings-sec-parser">
+              <h2>文档解析说明</h2>
+              <p class="settings-desc">系统支持 PDF、DOCX、XLSX、TXT、MD 等常见工程文档本地解析，不向外部上传原件。</p>
+              <div class="info-card">
+                <p>• <strong>原件隔离</strong>：每个项目拥有独立目录与独立 SQLite 数据库，互不串库。</p>
+                <p>• <strong>核对边界</strong>：复杂跨页表格、CAD 图纸及扫描件 OCR 结果请务必结合原件复核。</p>
+              </div>
+            </div>
+
+            <div class="settings-panel" id="settings-sec-backup">
+              <h2>数据与备份</h2>
+              <p class="settings-desc">为当前项目数据库与上传原件创建一致性 ZIP 备份存档。</p>
+              <div class="info-card" id="backup-result-card">
+                <p>点击右侧或下方“创建备份”即可打包当前项目独立数据库与文件快照。</p>
+              </div>
+              <div class="settings-footer-actions">
+                <button class="btn-primary" id="btn-backup-center" type="button">立即创建备份</button>
+              </div>
+            </div>
+
+            <div class="settings-panel" id="settings-sec-about">
+              <h2>关于系统</h2>
+              <p class="settings-desc">《基于检索增强生成的工程询价文档智能处理系统设计与实现》</p>
+              <div class="info-card">
+                <p>• 支持多项目独立数据库隔离管理与一键切换。</p>
+                <p>• 面向 RFQ 询价文件、技术协议、澄清文件、会议纪要及参数表提供智能问答、原文溯源、双栏对照与结果导出。</p>
+                <p>• 生成结果仅供工程师人工审核，不代替技术批准或合同判断。</p>
+              </div>
+            </div>
+          </section>
+
+          <!-- Right: 当前配置摘要 & 运行状态 -->
+          <aside class="col-right settings-right">
+            <div class="rail-header">
+              <h2>当前配置摘要</h2>
+            </div>
+            <dl class="kv-grid kv-grid-settings" id="settings-summary-kv"></dl>
+
+            <div class="rail-header rail-header-spaced">
+              <h2>运行状态</h2>
+            </div>
+            <ul class="status-list" id="settings-status-list"></ul>
+            <div class="status-updated" id="settings-updated-at">最近更新：-</div>
+            <div class="backup-btn-wrap">
+              <button class="btn-secondary" id="btn-create-backup" type="button">创建备份</button>
+            </div>
+          </aside>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <!-- Modal: 新建项目数据库 -->
+  <div class="modal-backdrop hidden" id="modal-new-project">
+    <div class="modal-card">
+      <div class="modal-header">
+        <h3>新建项目（独立数据库）</h3>
+        <button class="modal-close" data-close="modal-new-project" type="button">×</button>
+      </div>
+      <div class="modal-body">
+        <div class="modal-field">
+          <label>项目名称</label>
+          <input type="text" id="new-proj-name" class="form-input" placeholder="例如：B12 变电站询价项目" />
+        </div>
+        <div class="modal-field">
+          <label>项目标识 ID（选填，英文/数字/短横线）</label>
+          <input type="text" id="new-proj-id" class="form-input" placeholder="例如：b12-substation（留空自动生成）" />
+        </div>
+        <div class="modal-field">
+          <label>项目说明（选填）</label>
+          <input type="text" id="new-proj-desc" class="form-input" placeholder="该项目的工程背景或备注" />
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn-secondary" data-close="modal-new-project" type="button">取消</button>
+        <button class="btn-primary" id="btn-confirm-new-project" type="button">创建并切换</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Modal: 上传资料 -->
+  <div class="modal-backdrop hidden" id="modal-upload">
+    <div class="modal-card">
+      <div class="modal-header">
+        <h3>上传资料到当前项目</h3>
+        <button class="modal-close" data-close="modal-upload" type="button">×</button>
+      </div>
+      <div class="modal-body">
+        <div class="modal-field">
+          <label>所属目录</label>
+          <select id="upload-folder-select" class="form-select"></select>
+        </div>
+        <div class="modal-field">
+          <label>版本标签</label>
+          <input type="text" id="upload-version-input" class="form-input" value="Rev.A" placeholder="例如：Rev.A / Rev.0" />
+        </div>
+        <div class="modal-field">
+          <label>选择工程文档（PDF / DOCX / XLSX / TXT / MD）</label>
+          <input type="file" id="upload-file-input" class="form-input" multiple />
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn-secondary" data-close="modal-upload" type="button">取消</button>
+        <button class="btn-primary" id="btn-confirm-upload" type="button">上传并解析索引</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Modal: 新建文件夹 -->
+  <div class="modal-backdrop hidden" id="modal-folder">
+    <div class="modal-card">
+      <div class="modal-header">
+        <h3>新建资料文件夹</h3>
+        <button class="modal-close" data-close="modal-folder" type="button">×</button>
+      </div>
+      <div class="modal-body">
+        <div class="modal-field">
+          <label>文件夹名称</label>
+          <input type="text" id="new-folder-name" class="form-input" placeholder="例如：供应商澄清资料" />
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn-secondary" data-close="modal-folder" type="button">取消</button>
+        <button class="btn-primary" id="btn-confirm-folder" type="button">创建</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="toast hidden" id="toast"></div>
+  <script src="/static/app.js"></script>
+</body>
+</html>
