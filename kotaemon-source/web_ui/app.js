@@ -299,16 +299,17 @@ async function loadDocDetail(docId) {
     $("#detail-open-source").href = `/api/projects/${encodeURIComponent(state.projectId)}/source/${encodeURIComponent(doc.id)}`;
     $("#detail-kv-grid").innerHTML = `
       <div class="kv-row"><dt>版本</dt><dd>${esc(doc.version)}</dd></div>
-      <div class="kv-row"><dt>页数</dt><dd>${doc.pages} 页</dd></div>
+      <div class="kv-row"><dt>页数</dt><dd>${doc.pages > 0 ? esc(doc.pages) + " 页" : "—"}</dd></div>
       <div class="kv-row"><dt>更新时间</dt><dd>${esc(doc.updated_at)}</dd></div>
-      <div class="kv-row"><dt>是否已索引</dt><dd>${doc.indexed ? "是" : "否"}</dd></div>
+      <div class="kv-row"><dt>解析状态</dt><dd>${esc(doc.status)}</dd></div>
       <div class="kv-row"><dt>所属目录</dt><dd>${esc(doc.folder)}</dd></div>
       <div class="kv-row"><dt>文件大小</dt><dd>${formatSize(doc.size_bytes)}</dd></div>
     `;
     const chunk = data.active_chunk;
-    $("#detail-preview-body").innerHTML = chunk
+    const warnings = (doc.parse_warnings || []).map((message) => '<li>' + esc(message) + '</li>').join("");
+    $("#detail-preview-body").innerHTML = (warnings ? '<ul class="basis-list">' + warnings + '</ul>' : "") + (chunk
       ? highlightText(chunk.content, chunk.highlight, "hl-yellow")
-      : '<div class="empty-state-box">暂无可预览文本内容</div>';
+      : '<div class="empty-state-box">暂无可预览文本内容</div>');
   } catch {
     renderEmptyDocDetail();
   }
@@ -362,6 +363,9 @@ function renderChatFeed() {
   feed.innerHTML = state.chatMessages
     .map((turn, tIdx) => {
       const p = turn.payload || {};
+      const r = p.retrieval || {};
+      const scopeText = r.scope ? r.scope + " · " + r.evidence_count + " 条回答依据" : "";
+      const verificationWarnings = ((p.verification || {}).warnings || []).map((message) => '<li>' + esc(message) + '</li>').join("");
       const basisHtml = (p.basis || []).length
         ? `<div class="answer-subhead">主要依据</div>
            <ul class="basis-list">
@@ -393,6 +397,8 @@ function renderChatFeed() {
           </div>
           <div class="ai-answer">
             <div class="blue-bar-title">检索结论</div>
+            ${scopeText ? '<p class="rail-sub">' + esc(scopeText) + '</p>' : ""}
+            ${verificationWarnings ? '<ul class="basis-list">' + verificationWarnings + '</ul>' : ""}
             <p class="answer-paragraph">${formatInlineMarkdown(p.conclusion || "")}</p>
             ${basisHtml}
             ${tableHtml}
@@ -451,7 +457,11 @@ function setQaCitations(citations, activeIdx = 0) {
     state.previewDocId = c.doc_id;
     state.previewChunks = [c];
     state.previewChunkIdx = 0;
-    renderQaPreviewCard(c.file_name, `第 ${c.page} 页 · ${c.section}`, c.page, c.total_pages, c.content, c.highlight, c.doc_id);
+    renderQaPreviewCard(c.file_name, c.location || c.section, c.page, c.total_pages, c.content, c.highlight, c.doc_id);
+  } else {
+    state.previewChunks = [];
+    state.previewDocId = null;
+    renderEmptyQaPreview();
   }
 }
 
@@ -467,7 +477,7 @@ function renderCitationTabs() {
       <button class="citation-tab-btn ${i === state.activeCitationIndex ? "active" : ""}" data-idx="${i}" type="button">
         <span class="citation-tab-idx">[${c.index}]</span>
         <span class="citation-tab-file">${esc(c.file_name)}</span>
-        <span class="citation-tab-loc">第 ${c.page} 页 · ${esc(c.section)}</span>
+        <span class="citation-tab-loc">${esc(c.location || c.section)}</span>
       </button>
     `
     )
@@ -487,7 +497,7 @@ async function openDocInQaPreview(docId) {
   const doc = data.document;
   const ch = state.previewChunks[0];
   if (ch) {
-    renderQaPreviewCard(doc.name, `第 ${ch.page} 页 · ${ch.section}`, ch.page, doc.pages, ch.content, ch.highlight, doc.id);
+    renderQaPreviewCard(doc.name, ch.section, ch.page, doc.pages, ch.content, ch.highlight, doc.id);
   } else {
     renderQaPreviewCard(doc.name, "暂无文本片段", 1, doc.pages, "该文档暂无已解析文本。", "", doc.id);
   }
@@ -496,7 +506,7 @@ async function openDocInQaPreview(docId) {
 function renderQaPreviewCard(name, loc, page, totalPages, content, highlight, docId) {
   $("#qa-preview-name").textContent = name;
   $("#qa-preview-loc").textContent = loc;
-  $("#qa-page-indicator").textContent = `${page} / ${totalPages || 1}`;
+  $("#qa-page-indicator").textContent = totalPages > 0 ? `${page} / ${totalPages}` : "—";
   $("#qa-preview-body").innerHTML = highlightText(content, highlight, "hl-yellow");
   $("#qa-open-full-file").href = `/api/projects/${encodeURIComponent(state.projectId)}/source/${encodeURIComponent(docId)}`;
 }
@@ -526,9 +536,7 @@ async function handleSendQuestion() {
     });
     state.chatMessages.push(data.turn);
     renderChatFeed();
-    if (data.turn.payload && data.turn.payload.citations && data.turn.payload.citations.length) {
-      setQaCitations(data.turn.payload.citations, 0);
-    }
+    setQaCitations(data.turn.payload?.citations || [], 0);
   } catch (err) {
     showToast(err.message);
   } finally {
@@ -781,6 +789,7 @@ function syncSettingsForm() {
   $("#cfg-threshold-val").value = thr;
   $("#cfg-top-k").value = String(s.top_k ?? 10);
   $("#cfg-ocr").checked = Boolean(s.ocr_enabled);
+  $("#cfg-online-answers").checked = s.online_answers_enabled === true;
   $("#cfg-data-path").value = s.data_path || "";
   $("#cfg-chunk-size").value = s.chunk_size ?? 480;
   $("#cfg-chunk-overlap").value = s.chunk_overlap ?? 64;
@@ -794,6 +803,7 @@ function readSettingsFromForm() {
     similarity_threshold: Number($("#cfg-threshold").value),
     top_k: Number($("#cfg-top-k").value),
     ocr_enabled: $("#cfg-ocr").checked,
+    online_answers_enabled: $("#cfg-online-answers").checked,
     chunk_size: Number($("#cfg-chunk-size").value),
     chunk_overlap: Number($("#cfg-chunk-overlap").value),
   };
@@ -815,7 +825,7 @@ function renderSettingsRightRail() {
     <li><span class="st-label">模型接口</span><span class="st-val"><i class="st-dot"></i>${esc(st.model_api || "连接正常")}</span></li>
     <li><span class="st-label">向量服务</span><span class="st-val"><i class="st-dot"></i>${esc(st.vector_service || "连接正常")}</span></li>
     <li><span class="st-label">索引服务</span><span class="st-val"><i class="st-dot"></i>${esc(st.index_service || "运行中")}</span></li>
-    <li><span class="st-label">OCR 服务</span><span class="st-val"><i class="st-dot ${s.ocr_enabled ? "" : "off"}"></i>${s.ocr_enabled ? "运行中" : "已关闭"}</span></li>
+    <li><span class="st-label">OCR 服务</span><span class="st-val"><i class="st-dot ${s.ocr_enabled ? "" : "off"}"></i>${esc(st.ocr_service || "状态未查询")}</span></li>
   `;
   $("#settings-updated-at").textContent = `最近更新：${st.updated_at || "-"}`;
 }
@@ -912,14 +922,14 @@ function bindEvents() {
     state.previewChunkIdx = Math.max(0, state.previewChunkIdx - 1);
     const ch = state.previewChunks[state.previewChunkIdx];
     const doc = state.docsData.documents.find((d) => d.id === state.previewDocId);
-    renderQaPreviewCard(doc ? doc.name : "", `第 ${ch.page} 页 · ${ch.section}`, ch.page, doc ? doc.pages : state.previewChunks.length, ch.content, ch.highlight, state.previewDocId);
+    renderQaPreviewCard(doc ? doc.name : "", ch.section, ch.page, doc?.pages, ch.content, ch.highlight, state.previewDocId);
   });
   $("#qa-next-page").addEventListener("click", () => {
     if (state.previewChunks.length <= 1) return;
     state.previewChunkIdx = Math.min(state.previewChunks.length - 1, state.previewChunkIdx + 1);
     const ch = state.previewChunks[state.previewChunkIdx];
     const doc = state.docsData.documents.find((d) => d.id === state.previewDocId);
-    renderQaPreviewCard(doc ? doc.name : "", `第 ${ch.page} 页 · ${ch.section}`, ch.page, doc ? doc.pages : state.previewChunks.length, ch.content, ch.highlight, state.previewDocId);
+    renderQaPreviewCard(doc ? doc.name : "", ch.section, ch.page, doc?.pages, ch.content, ch.highlight, state.previewDocId);
   });
 
   // Docs interactions
@@ -1089,6 +1099,7 @@ function bindEvents() {
       similarity_threshold: 0.62,
       top_k: 10,
       ocr_enabled: true,
+      online_answers_enabled: false,
     };
     syncSettingsForm();
     renderSettingsRightRail();

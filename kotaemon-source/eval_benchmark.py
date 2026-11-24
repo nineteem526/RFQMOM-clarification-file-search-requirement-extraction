@@ -7,32 +7,29 @@ Measures:
   Evidence Recall@1/@3/@5, MRR, Refusal Accuracy, Latency (ms)
 """
 
+import argparse
 import json
 from pathlib import Path
 import re
-import sys
 
 from rag_engine import embed_text, hybrid_search
 from web_app import _extract_text_from_file
 
 
 def _norm(text: str) -> str:
-    return re.sub(r"\s+", " ", (text or "").replace("\\n", " ")).strip().lower()
+    return re.sub(r"\s+", " ", (text or "").replace("\\n", " ").replace("\u00ad", "")).strip().casefold()
 
 
 def _snippet_in_chunks(snippet: str, chunks: list[dict]) -> bool:
     needle = _norm(snippet)
     if not needle:
         return False
-    joined = _norm(" ".join(c.get("content", "") for c in chunks))
-    if needle in joined:
-        return True
-    # Check meaningful token overlap (>= 75% of alphanumeric/word tokens present)
-    words = [w for w in re.findall(r"[a-z0-9][a-z0-9.\-]*", needle) if len(w) >= 2]
-    if not words:
-        return False
-    hits = sum(1 for w in words if w in joined)
-    return (hits / len(words)) >= 0.75
+    # Whole reference snippet in a single chunk. Word boundaries avoid counting
+    # partial IDs and numbers such as 18 in 118 or IP54 in IP540.
+    left = r"(?<!\w)" if needle[0].isalnum() else ""
+    right = r"(?!\w)" if needle[-1].isalnum() else ""
+    pattern = re.compile(left + re.escape(needle) + right)
+    return any(pattern.search(_norm(chunk.get("content", ""))) for chunk in chunks)
 
 
 def eval_makita_pdf(
@@ -43,6 +40,7 @@ def eval_makita_pdf(
     chunk_size: int = 480,
     chunk_overlap: int = 64,
     show_bad_cases: bool = True,
+    include_cases: bool = False,
 ) -> dict:
     raw_chunks = _extract_text_from_file(
         pdf_path, chunk_size=chunk_size, chunk_overlap=chunk_overlap, ocr_enabled=False
@@ -69,6 +67,7 @@ def eval_makita_pdf(
     mrr_sum = 0.0
     latencies = []
     bad_cases = []
+    case_results = []
 
     for row in rows:
         is_unanswerable = str(row.get("category", "")).strip().lower() == "unanswerable" or _norm(row.get("gt_answer_snippet", "")) == "not answered"
@@ -97,6 +96,8 @@ def eval_makita_pdf(
                     "qid": row["question_id"], "cat": "Unanswerable",
                     "gt_page": None, "got_pages": pages, "q": q[:80], "snip": "should refuse",
                 })
+            case_results.append({"qid": row["question_id"], "page_ranks": pages, "empty_result": not hits,
+                                 "answerable": False})
             continue
 
         page_ok3 = True
@@ -126,6 +127,11 @@ def eval_makita_pdf(
             if _snippet_in_chunks(gt_snip, hits[:5]):
                 s5 += 1
             snip_ok3 = _snippet_in_chunks(gt_snip, hits[:3])
+        case_results.append({
+            "qid": row["question_id"], "answerable": True, "reference_page": gt_page,
+            "page_ranks": pages, "empty_result": not hits,
+            "exact_snippet_hit_at": [k for k in (1, 3, 5) if _snippet_in_chunks(gt_snip, hits[:k])],
+        })
 
         if not page_ok3 or not snip_ok3:
             bad_cases.append({
@@ -142,6 +148,8 @@ def eval_makita_pdf(
         "mode": retrieval_mode,
         "chunks": len(candidates),
         "answerable_count": page_total,
+        "snippet_count": snip_total,
+        "snippet_match": "exact_within_one_chunk",
         "page_recall_at_1": round(p1 / max(1, page_total), 4),
         "page_recall_at_3": round(p3 / max(1, page_total), 4),
         "page_recall_at_5": round(p5 / max(1, page_total), 4),
@@ -155,6 +163,8 @@ def eval_makita_pdf(
     }
     if show_bad_cases:
         report["sample_bad_cases"] = bad_cases[:8]
+    if include_cases:
+        report["cases"] = case_results
     return report
 
 
@@ -200,15 +210,23 @@ def eval_cn_rfq(fixture_path: Path, retrieval_mode: str = "混合检索（语义
 
 
 if __name__ == "__main__":
-    workspace_root = Path(__file__).resolve().parents[2]
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--data-root", type=Path, default=Path(__file__).resolve().parents[2])
+    parser.add_argument("--include-cases", action="store_true")
+    parser.add_argument("--hybrid-threshold", type=float, default=0.62)
+    args = parser.parse_args()
+    workspace_root = args.data_root
     pdf = workspace_root / "公开测试数据" / "Makita_XFD12_manual.pdf"
     jsonl = workspace_root / "公开测试数据" / "Makita_XFD12_35题.jsonl"
     cn_fixture = workspace_root / "p0-fixture.json"
 
     out = {
-        "makita_hybrid": eval_makita_pdf(pdf, jsonl, "混合检索（语义 + 关键词）", threshold=0.55),
-        "makita_bm25": eval_makita_pdf(pdf, jsonl, "精确关键词检索", threshold=0.55, show_bad_cases=False),
-        "makita_bge": eval_makita_pdf(pdf, jsonl, "语义向量检索", threshold=0.50, show_bad_cases=False),
+        "makita_hybrid": eval_makita_pdf(pdf, jsonl, "混合检索（语义 + 关键词）", threshold=args.hybrid_threshold,
+                                        include_cases=args.include_cases),
+        "makita_bm25": eval_makita_pdf(pdf, jsonl, "精确关键词检索", threshold=0.55, show_bad_cases=False,
+                                      include_cases=args.include_cases),
+        "makita_bge": eval_makita_pdf(pdf, jsonl, "语义向量检索", threshold=0.50, show_bad_cases=False,
+                                     include_cases=args.include_cases),
         "cn_rfq_hybrid": eval_cn_rfq(cn_fixture, "混合检索（语义 + 关键词）", threshold=0.62),
     }
     print(json.dumps(out, ensure_ascii=False, indent=2))

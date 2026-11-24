@@ -72,8 +72,8 @@
               <div class="composer-meta">
                 <select id="qa-mode-select" class="inline-select" aria-label="问答模式">
                   <option value="快速问答">快速问答</option>
-                  <option value="主题逐文件检查">主题逐文件检查</option>
-                  <option value="深度全文检查">深度全文检查</option>
+                  <option value="扩展候选检索">扩展候选检索</option>
+                  <option value="更多候选检索">更多候选检索</option>
                 </select>
                 <span class="meta-sep">|</span>
                 <span class="meta-hint">回答基于检索片段，可能不完整。</span>
@@ -385,6 +385,16 @@
                     <span class="toggle-track"></span>
                   </label>
                   <div class="form-help">启用后，可对扫描件、图片类文档进行文字识别并纳入检索。</div>
+                </div>
+              </div>
+              <div class="form-row">
+                <label class="form-label" for="cfg-online-answers">企业模型问答</label>
+                <div class="form-control">
+                  <label class="toggle-switch">
+                    <input type="checkbox" id="cfg-online-answers" />
+                    <span class="toggle-track"></span>
+                  </label>
+                  <div class="form-help">仅在本项目资料获准发送时启用。当前问题和检索片段将发往已批准的企业端点。</div>
                 </div>
               </div>
               <div class="form-row">

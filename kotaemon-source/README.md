@@ -1,5 +1,17 @@
 # Kotaemon engineering knowledge assistant
 
+## 本机多项目工作台
+
+在本文所述的专用 Python 环境准备完成后，从此目录运行：
+
+    & "$env:LOCALAPPDATA\RFQKotaemon\runtime\.venv\Scripts\python.exe" -B .\web_app.py --port 7866
+
+工作台默认监听本机回环地址。新项目默认使用本地检索和原文摘录。资料获准发送给企业模型后，先按下文配置已批准的企业端点，再在该项目的设置中启用“企业模型问答”。工作台使用已有的企业 Azure 适配器。
+
+旧工作台数据库首次打开时，旧版入库的 PDF、Excel 和曾以失败占位文字入库的文件会标记为“待重新解析”。到资料页重新解析这些文件以恢复检索，原件保留在已有项目中。答复只使用候选检索结果中的证据，界面会显示实际证据条数和检查范围。
+
+Makita 和中文 RFQ 本地检索评测可运行 `python -B eval_benchmark.py --data-root "<评测资料上一级目录>" --include-cases`。Makita 的片段命中要求单条候选包含完整参考原文。
+
 Source snapshot prepared on 2026-10-29 from the locally maintained application.
 The sibling `kotaemon-pilot` remains the existing local installation and is not
 modified by this publication. This snapshot includes its current application

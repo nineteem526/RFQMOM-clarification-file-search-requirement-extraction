@@ -7,8 +7,11 @@ saved results, and settings.
 """
 
 import argparse
+from contextlib import closing, contextmanager
+from dataclasses import dataclass
 from datetime import datetime
 from difflib import SequenceMatcher
+from html import escape
 import hashlib
 import io
 import json
@@ -17,6 +20,7 @@ from pathlib import Path
 import re
 import shutil
 import sqlite3
+import sys
 import uuid
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
@@ -25,6 +29,7 @@ from fastapi.staticfiles import StaticFiles
 import uvicorn
 
 from pilot_runtime import prepare_runtime
+from runtime_paths import ocr_root
 from rag_engine import (
     embed_text,
     embedding_health,
@@ -42,6 +47,7 @@ DEFAULT_SETTINGS = {
     "similarity_threshold": 0.62,
     "top_k": 10,
     "ocr_enabled": True,
+    "online_answers_enabled": False,
     "chunk_size": 480,
     "chunk_overlap": 64,
     "data_path": "",
@@ -54,6 +60,13 @@ DEFAULT_FOLDERS = [
     "会议纪要",
     "其他资料",
 ]
+QUERY_CACHE_FORMAT = 2
+QUERY_MODES = {"快速问答": 0, "扩展候选检索": 12, "更多候选检索": 20}
+LEGACY_QUERY_MODES = {"主题逐文件检查": "扩展候选检索", "深度全文检查": "更多候选检索"}
+CHUNKS_FOR_DISPLAY = (
+    "SELECT id, doc_id, page, section, content, highlight FROM chunks "
+    "WHERE doc_id=? ORDER BY page, rowid"
+)
 
 
 def _now_str():
@@ -80,92 +93,83 @@ def _format_size(num_bytes: int) -> str:
     return f"{num_bytes} B"
 
 
-def _extract_text_from_file(
+@dataclass
+class ParsedDocument:
+    chunks: list[dict]
+    pages: int
+    warnings: list[str]
+
+
+def _parse_document(
     path: Path,
     chunk_size: int = 480,
     chunk_overlap: int = 64,
     ocr_enabled: bool = True,
-) -> list[dict]:
+) -> ParsedDocument:
     """Extract readable text pages/sections locally with overlap-aware chunking."""
     suffix = path.suffix.lower()
     raw_sections: list[tuple[int, str, str]] = []
+    warnings = []
+    pages = 0
+
+    def add_pdf_page(number, text):
+        if not text and ocr_enabled:
+            try:
+                from local_ocr import recognize_page
+
+                lines = recognize_page(path, number)
+                text = "\n".join(line["text"].strip() for line in lines if line["text"].strip())
+                if text:
+                    text = "[OCR识别，请核对原页]\n" + text
+                    warnings.append(f"第 {number} 页使用本地 OCR，引用需核对原页。")
+            except (ValueError, OSError) as exc:
+                warnings.append(f"第 {number} 页 OCR 失败（{type(exc).__name__}）：{exc}")
+        if text:
+            raw_sections.append((number, f"第 {number} 页", text))
+        else:
+            warnings.append(f"第 {number} 页没有可索引文本。")
 
     if suffix in {".txt", ".md", ".csv", ".json", ".log"}:
-        text = path.read_text(encoding="utf-8", errors="replace")
-        raw_sections.append((1, "正文", text))
+        try:
+            text = path.read_text(encoding="utf-8-sig")
+            raw_sections.append((1, "正文", text))
+        except (OSError, UnicodeError) as exc:
+            warnings.append(f"文本读取失败（{type(exc).__name__}）。")
 
     elif suffix == ".pdf":
         # P1: Structured PDF extraction using PyMuPDF (fitz) — preserves multi-column reading order & tables
-        extracted_pdf = False
         try:
             import fitz  # type: ignore
 
-            doc = fitz.open(str(path))
-            for idx, page in enumerate(doc, 1):
-                page_parts: list[str] = []
-                # 1. Extract structured tables with header-bound rows
-                try:
-                    tabs = page.find_tables()
-                    for t_idx, tab in enumerate(tabs.tables if tabs else [], 1):
-                        matrix = tab.extract() or []
-                        clean_rows = [
-                            [re.sub(r"\s+", " ", str(c or "")).strip() for c in r]
-                            for r in matrix
-                            if any(str(c or "").strip() for c in r)
-                        ]
-                        if not clean_rows:
-                            continue
-                        header = clean_rows[0]
-                        table_lines = [f"[表格 {t_idx}] " + " | ".join(h for h in header if h)]
-                        for r in clean_rows[1:]:
-                            paired = []
-                            for col_i, val in enumerate(r):
-                                if not val:
-                                    continue
-                                h_name = header[col_i] if col_i < len(header) and header[col_i] else f"列{col_i + 1}"
-                                paired.append(f"{h_name}: {val}" if h_name != val else val)
-                            if paired:
-                                table_lines.append(" | ".join(paired))
-                        if len(table_lines) > 1:
-                            raw_sections.append((idx, f"第 {idx} 页 · 表格 {t_idx}", "\n".join(table_lines)))
-                except Exception:
-                    pass
-
-                # 2. Extract reading-order text blocks (handles two-column manuals cleanly)
-                blocks = page.get_text("blocks", sort=True)
-                for b in blocks:
-                    b_txt = (b[4] or "").strip() if len(b) > 4 else ""
-                    if b_txt:
-                        page_parts.append(re.sub(r"[ \t]+", " ", b_txt))
-                txt = "\n\n".join(page_parts).strip()
-
-                if not txt and ocr_enabled:
+            with fitz.open(path) as doc:
+                if not doc.is_pdf or doc.needs_pass:
+                    raise ValueError("PDF 格式无效或已加密。")
+                pages = len(doc)
+                for idx, page in enumerate(doc, 1):
                     try:
-                        from local_ocr import ocr_pdf_page  # type: ignore
-
-                        ocr_txt = (ocr_pdf_page(path, idx - 1) or "").strip()
-                        if ocr_txt:
-                            txt = "[OCR识别，请核对原页]\n" + ocr_txt
-                    except Exception:
-                        txt = ""
-                if txt:
-                    raw_sections.append((idx, f"第 {idx} 页", txt))
-            doc.close()
-            extracted_pdf = bool(raw_sections)
-        except Exception:
-            extracted_pdf = False
-
-        if not extracted_pdf:
+                        _append_pdf_text(page, idx, raw_sections, warnings, add_pdf_page)
+                    except (RuntimeError, ValueError, OSError) as exc:
+                        warnings.append(f"第 {idx} 页解析失败（{type(exc).__name__}），请核对原件。")
+        except (ImportError, RuntimeError, ValueError, OSError):
+            # The fallback reads the same file. Discard any partial first attempt.
+            raw_sections.clear()
+            warnings.clear()
+            pages = 0
             try:
-                import pypdf  # type: ignore
+                import pypdf
 
-                reader = pypdf.PdfReader(str(path))
+                reader = pypdf.PdfReader(path)
+                if reader.is_encrypted:
+                    raise ValueError("PDF 已加密。")
+                pages = len(reader.pages)
+                warnings.append("PDF 使用备用文本解析，未提取结构化表格。")
                 for idx, page in enumerate(reader.pages, 1):
-                    txt = (page.extract_text() or "").strip()
-                    if txt:
-                        raw_sections.append((idx, f"第 {idx} 页", txt))
+                    try:
+                        add_pdf_page(idx, (page.extract_text() or "").strip())
+                    except (pypdf.errors.PyPdfError, ValueError, OSError) as exc:
+                        warnings.append(f"第 {idx} 页解析失败（{type(exc).__name__}），请核对原件。")
             except Exception:
-                pass
+                warnings.append("PDF 无法读取或已加密，请核对原件。")
 
     elif suffix == ".docx":
         try:
@@ -183,35 +187,29 @@ def _extract_text_from_file(
                         t_rows.append(" | ".join(vals))
                 if t_rows:
                     raw_sections.append((t_idx + 1, f"表格 {t_idx}", "\n".join(t_rows)))
-        except Exception:
-            pass
+        except Exception as exc:
+            warnings.append(f"Word 解析中断（{type(exc).__name__}），请核对原件。")
 
     elif suffix in {".xlsx", ".xlsm"}:
         try:
             import openpyxl  # type: ignore
 
-            wb = openpyxl.load_workbook(str(path), data_only=True, read_only=True)
-            for s_idx, sheet_name in enumerate(wb.sheetnames, 1):
-                ws = wb[sheet_name]
-                rows = []
-                header = None
-                for row in ws.iter_rows(values_only=True):
-                    vals = [str(c).strip() for c in row if c is not None and str(c).strip()]
-                    if not vals:
+            with closing(openpyxl.load_workbook(path, data_only=True, read_only=True)) as wb:
+                for s_idx, sheet_name in enumerate(wb.sheetnames, 1):
+                    matrix = (
+                        ["" if cell is None else str(cell).strip() for cell in row]
+                        for row in wb[sheet_name].iter_rows(values_only=True)
+                    )
+                    header = next((row for row in matrix if any(row)), [])
+                    if not header:
                         continue
-                    if header is None:
-                        header = vals
-                        rows.append(f"[表头] " + " | ".join(header))
-                    else:
-                        paired = []
-                        for ci, val in enumerate(vals):
-                            hn = header[ci] if ci < len(header) else f"列{ci + 1}"
-                            paired.append(f"{hn}: {val}")
-                        rows.append(" | ".join(paired))
-                if rows:
+                    rows = ["[表头] " + " | ".join(header)]
+                    rows.extend(line for row in matrix if (line := _bind_table_row(header, row)))
                     raw_sections.append((s_idx, f"工作表 {sheet_name}", "\n".join(rows)))
-        except Exception:
-            pass
+        except Exception as exc:
+            warnings.append(f"Excel 解析中断（{type(exc).__name__}），请核对原件。")
+    else:
+        warnings.append("此文件格式暂无本地解析器。")
 
     chunks: list[dict] = []
     for page_no, sec_name, body in raw_sections:
@@ -220,13 +218,42 @@ def _extract_text_from_file(
             label = sec_name if len(parts) == 1 else f"{sec_name} ({p_idx}/{len(parts)})"
             chunks.append({"page": page_no, "section": label, "content": part})
 
-    if chunks:
-        return chunks
-    return [{
-        "page": 1,
-        "section": "文件摘要",
-        "content": f"已上传文件 {path.name}（{_format_size(path.stat().st_size)}）。当前格式需要人工核对原件或安装对应解析器。",
-    }]
+    if not chunks and not warnings:
+        warnings.append("文件没有可索引文本。")
+    return ParsedDocument(chunks, pages, warnings)
+
+
+def _bind_table_row(header, row):
+    parts = []
+    for column, value in enumerate(row):
+        if value:
+            name = (header[column] if column < len(header) else "") or f"列{column + 1}"
+            parts.append(f"{name}: {value}" if name != value else value)
+    return " | ".join(parts)
+
+
+def _append_pdf_text(page, number, sections, warnings, add_pdf_page):
+    try:
+        for index, table in enumerate(page.find_tables().tables, 1):
+            rows = [
+                [re.sub(r"\s+", " ", str(c or "")).strip() for c in row]
+                for row in table.extract() or [] if any(str(c or "").strip() for c in row)
+            ]
+            if len(rows) > 1:
+                header = rows[0]
+                lines = [f"[表格 {index}] " + " | ".join(c for c in header if c)]
+                lines.extend(_bind_table_row(header, row) for row in rows[1:])
+                sections.append((number, f"第 {number} 页 · 表格 {index}", "\n".join(lines)))
+    except Exception as exc:
+        warnings.append(f"第 {number} 页表格解析失败（{type(exc).__name__}），请核对原件。")
+    blocks = (re.sub(r"[ \t]+", " ", block[4].strip()) for block in page.get_text("blocks", sort=True)
+              if len(block) > 6 and block[6] == 0 and block[4].strip())
+    add_pdf_page(number, "\n\n".join(blocks))
+
+
+def _extract_text_from_file(path: Path, chunk_size=480, chunk_overlap=64, ocr_enabled=True) -> list[dict]:
+    """Keep the retrieval benchmark on the same parser as uploads."""
+    return _parse_document(path, chunk_size, chunk_overlap, ocr_enabled).chunks
 
 
 class ProjectStore:
@@ -245,10 +272,12 @@ class ProjectStore:
             d.mkdir(parents=True, exist_ok=True)
         self._init_db()
 
-    def _conn(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(str(self.db_path))
-        conn.row_factory = sqlite3.Row
-        return conn
+    @contextmanager
+    def _conn(self):
+        with closing(sqlite3.connect(str(self.db_path))) as conn:
+            conn.row_factory = sqlite3.Row
+            with conn:
+                yield conn
 
     def _init_db(self):
         with self._conn() as conn:
@@ -270,6 +299,7 @@ class ProjectStore:
                     status TEXT DEFAULT '已索引',
                     indexed INTEGER DEFAULT 1,
                     file_path TEXT DEFAULT '',
+                    parse_warnings TEXT DEFAULT '[]',
                     sha256 TEXT DEFAULT ''
                 );
                 CREATE TABLE IF NOT EXISTS chunks (
@@ -321,6 +351,22 @@ class ProjectStore:
             cols = {row["name"] for row in conn.execute("PRAGMA table_info(chunks)")}
             if "embedding" not in cols:
                 conn.execute("ALTER TABLE chunks ADD COLUMN embedding BLOB DEFAULT NULL")
+            doc_cols = {row["name"] for row in conn.execute("PRAGMA table_info(documents)")}
+            if "parse_warnings" not in doc_cols:
+                conn.execute("ALTER TABLE documents ADD COLUMN parse_warnings TEXT DEFAULT '[]'")
+                # Older PDF page counts and sparse Excel rows may be wrong.
+                # Keep the original files so users can reparse them in place.
+                conn.execute(
+                    """
+                    UPDATE documents SET indexed=0, status='待重新解析', pages=0, parse_warnings=?
+                    WHERE file_path <> '' AND (
+                        UPPER(file_type) IN ('PDF', 'XLSX', 'XLSM')
+                        OR EXISTS (SELECT 1 FROM chunks WHERE doc_id=documents.id AND section='文件摘要')
+                    )
+                    """,
+                    (json.dumps(["请重新解析原件以更新页码、索引和解析状态。"], ensure_ascii=False),),
+                )
+                self._bump_revision(conn)
 
     def get_meta(self) -> dict:
         if self.meta_path.exists():
@@ -342,7 +388,7 @@ class ProjectStore:
         cfg = dict(DEFAULT_SETTINGS)
         cfg["data_path"] = str(self.root)
         with self._conn() as conn:
-            for row in conn.execute("SELECT key, value FROM settings"):
+            for row in conn.execute("SELECT key, value FROM settings WHERE key <> '_revision'"):
                 try:
                     cfg[row["key"]] = json.loads(row["value"])
                 except Exception:
@@ -354,25 +400,24 @@ class ProjectStore:
             row = conn.execute("SELECT value FROM settings WHERE key='_revision'").fetchone()
             return int(row["value"]) if row and str(row["value"]).isdigit() else 1
 
-    def bump_revision(self):
-        rev = self.get_revision() + 1
-        with self._conn() as conn:
-            conn.execute("INSERT OR REPLACE INTO settings(key, value) VALUES ('_revision', ?)", (str(rev),))
-            conn.execute("DELETE FROM query_cache WHERE revision < ?", (rev,))
+    @staticmethod
+    def _bump_revision(conn):
+        conn.execute("UPDATE settings SET value=CAST(value AS INTEGER)+1 WHERE key='_revision'")
+        conn.execute("DELETE FROM query_cache")
 
     def update_settings(self, patch: dict) -> dict:
-        current = self.get_settings()
-        for k, v in patch.items():
-            if k in DEFAULT_SETTINGS:
-                current[k] = v
+        if "online_answers_enabled" in patch and type(patch["online_answers_enabled"]) is not bool:
+            raise ValueError("在线回答开关必须为布尔值。")
+        updates = {k: v for k, v in patch.items() if k in DEFAULT_SETTINGS and k != "data_path"}
         with self._conn() as conn:
-            for k, v in current.items():
+            for k, v in updates.items():
                 conn.execute(
                     "INSERT OR REPLACE INTO settings(key, value) VALUES (?, ?)",
                     (k, json.dumps(v, ensure_ascii=False)),
                 )
-        self.bump_revision()
-        return current
+            if updates:
+                self._bump_revision(conn)
+        return self.get_settings()
 
     def list_folders(self) -> list[str]:
         with self._conn() as conn:
@@ -390,7 +435,13 @@ class ProjectStore:
             rows = conn.execute(
                 "SELECT * FROM documents ORDER BY updated_at DESC, name ASC"
             ).fetchall()
-            return [dict(r) for r in rows]
+            return [self._document_dict(r) for r in rows]
+
+    @staticmethod
+    def _document_dict(row):
+        doc = dict(row)
+        doc["parse_warnings"] = json.loads(doc.get("parse_warnings") or "[]")
+        return doc
 
     def get_document_preview(self, doc_id: str, page: int | None = None) -> dict:
         with self._conn() as conn:
@@ -399,16 +450,16 @@ class ProjectStore:
                 raise KeyError("未找到指定文档")
             chunks = [
                 dict(r) for r in conn.execute(
-                    "SELECT * FROM chunks WHERE doc_id=? ORDER BY page ASC, rowid ASC",
+                    CHUNKS_FOR_DISPLAY,
                     (doc_id,),
                 )
-            ]
-        doc_dict = dict(doc)
+            ] if doc["indexed"] else []
+        doc_dict = self._document_dict(doc)
         total_chunks = len(chunks)
         selected_chunk = None
         if page is not None:
             selected_chunk = next((c for c in chunks if c["page"] == page), None)
-        if selected_chunk is None and chunks:
+        elif chunks:
             selected_chunk = chunks[0]
         return {
             "document": doc_dict,
@@ -427,13 +478,23 @@ class ProjectStore:
         """Lazily backfill BGE 512-dim embeddings for any chunks missing vectors."""
         updated = 0
         with self._conn() as conn:
-            rows = conn.execute("SELECT id, content FROM chunks WHERE embedding IS NULL").fetchall()
+            rows = conn.execute(
+                "SELECT c.id, c.content FROM chunks c JOIN documents d ON d.id=c.doc_id "
+                "WHERE c.embedding IS NULL AND d.indexed=1"
+            ).fetchall()
             for r in rows:
                 blob = self._embed_safe(r["content"])
                 if blob is not None:
                     conn.execute("UPDATE chunks SET embedding=? WHERE id=?", (blob, r["id"]))
                     updated += 1
+            if updated:
+                self._bump_revision(conn)
         return updated
+
+    @staticmethod
+    def _parse_state(parsed):
+        status = "解析失败" if not parsed.chunks else ("部分索引，需核对" if parsed.warnings else "已索引")
+        return status, int(bool(parsed.chunks)), json.dumps(parsed.warnings, ensure_ascii=False)
 
     def ingest_upload(self, filename: str, content: bytes, folder: str, version: str = "Rev.0") -> dict:
         safe_name = Path(filename).name
@@ -445,7 +506,7 @@ class ProjectStore:
         target = self.files_dir / f"{doc_id}_{safe_name}"
         target.write_bytes(content)
         sha = hashlib.sha256(content).hexdigest()
-        extracted = _extract_text_from_file(
+        parsed = _parse_document(
             target,
             chunk_size=int(cfg.get("chunk_size", 480)),
             chunk_overlap=int(cfg.get("chunk_overlap", 64)),
@@ -456,18 +517,20 @@ class ProjectStore:
         with self._conn() as conn:
             conn.execute(
                 """
-                INSERT INTO documents(id, name, folder, file_type, version, pages, size_bytes, updated_at, status, indexed, file_path, sha256)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, '已索引', 1, ?, ?)
+                INSERT INTO documents(id, name, folder, file_type, version, pages, size_bytes, updated_at,
+                                      status, indexed, parse_warnings, file_path, sha256)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (doc_id, safe_name, folder, ext, version or "Rev.0", len(extracted), len(content), now, str(target), sha),
+                (doc_id, safe_name, folder, ext, version or "Rev.0", parsed.pages, len(content), now,
+                 *self._parse_state(parsed), str(target), sha),
             )
-            for idx, item in enumerate(extracted, 1):
+            for idx, item in enumerate(parsed.chunks, 1):
                 emb = self._embed_safe(item["content"])
                 conn.execute(
                     "INSERT INTO chunks(id, doc_id, page, section, content, highlight, embedding) VALUES (?, ?, ?, ?, ?, '', ?)",
                     (f"{doc_id}-c{idx}", doc_id, item["page"], item["section"], item["content"], emb),
                 )
-        self.bump_revision()
+            self._bump_revision(conn)
         return self.get_document_preview(doc_id)["document"]
 
     def reparse_document(self, doc_id: str) -> dict:
@@ -479,31 +542,36 @@ class ProjectStore:
             file_path = Path(doc["file_path"]) if doc["file_path"] else None
             now = _now_str()
             if file_path and file_path.exists():
-                extracted = _extract_text_from_file(
+                parsed = _parse_document(
                     file_path,
                     chunk_size=int(cfg.get("chunk_size", 480)),
                     chunk_overlap=int(cfg.get("chunk_overlap", 64)),
                     ocr_enabled=bool(cfg.get("ocr_enabled", True)),
                 )
                 conn.execute("DELETE FROM chunks WHERE doc_id=?", (doc_id,))
-                for idx, item in enumerate(extracted, 1):
+                for idx, item in enumerate(parsed.chunks, 1):
                     emb = self._embed_safe(item["content"])
                     conn.execute(
                         "INSERT INTO chunks(id, doc_id, page, section, content, highlight, embedding) VALUES (?, ?, ?, ?, ?, '', ?)",
                         (f"{doc_id}-c{idx}", doc_id, item["page"], item["section"], item["content"], emb),
                     )
                 conn.execute(
-                    "UPDATE documents SET pages=?, updated_at=?, status='已索引', indexed=1 WHERE id=?",
-                    (len(extracted), now, doc_id),
+                    "UPDATE documents SET pages=?, updated_at=?, status=?, indexed=?, parse_warnings=? WHERE id=?",
+                    (parsed.pages, now, *self._parse_state(parsed), doc_id),
                 )
-            else:
+            elif not file_path:
                 # Re-embed existing chunks for seeded docs
                 rows = conn.execute("SELECT id, content FROM chunks WHERE doc_id=?", (doc_id,)).fetchall()
                 for r in rows:
                     emb = self._embed_safe(r["content"])
                     conn.execute("UPDATE chunks SET embedding=? WHERE id=?", (emb, r["id"]))
                 conn.execute("UPDATE documents SET updated_at=?, status='已索引', indexed=1 WHERE id=?", (now, doc_id))
-        self.bump_revision()
+            else:
+                conn.execute(
+                    "UPDATE documents SET updated_at=?, status='解析失败', indexed=0, parse_warnings=? WHERE id=?",
+                    (now, json.dumps(["原件缺失，无法重新解析。"], ensure_ascii=False), doc_id),
+                )
+            self._bump_revision(conn)
         return self.get_document_preview(doc_id)
 
     def get_chat_history(self) -> list[dict]:
@@ -528,12 +596,19 @@ class ProjectStore:
         q = question.strip()
         if not q:
             raise ValueError("请输入要查询的问题")
+        mode = LEGACY_QUERY_MODES.get(mode, mode)
+        if mode not in QUERY_MODES:
+            raise ValueError("未知查询模式。")
+        self.ensure_embeddings()
         cfg = self.get_settings()
         rev = self.get_revision()
+        llm = llm_config_status() if cfg.get("online_answers_enabled") is True else {"configured": False}
         cache_sig = hashlib.sha256(
             json.dumps({
-                "q": re.sub(r"\s+", " ", q).lower(),
+                "q": q,
                 "mode": mode,
+                "format": QUERY_CACHE_FORMAT,
+                "provider": llm.get("cache_identity", ("local",)),
                 "rm": cfg.get("retrieval_mode"),
                 "thr": cfg.get("similarity_threshold"),
                 "k": cfg.get("top_k"),
@@ -561,12 +636,11 @@ class ProjectStore:
                 )
             return {"id": msg_id, "role": "turn", "question": q, "time": now_time, "payload": answer_payload}
 
-        self.ensure_embeddings()
         with self._conn() as conn:
             rows = conn.execute(
                 """
                 SELECT c.id, c.doc_id, c.page, c.section, c.content, c.highlight, c.embedding AS embedding_blob,
-                       d.name AS doc_name, d.version, d.pages AS doc_pages, d.folder
+                       d.name AS doc_name, d.version, d.pages AS doc_pages, d.folder, d.file_type
                 FROM chunks c
                 JOIN documents d ON d.id = c.doc_id
                 WHERE d.indexed = 1
@@ -574,11 +648,7 @@ class ProjectStore:
             ).fetchall()
         candidates = [dict(r) for r in rows]
 
-        top_k = int(cfg.get("top_k", 10))
-        if mode == "主题逐文件检查":
-            top_k = max(top_k, 12)
-        elif mode == "深度全文检查":
-            top_k = max(top_k, 20)
+        top_k = max(int(cfg.get("top_k", 10)), QUERY_MODES[mode])
 
         search_res = hybrid_search(
             query=q,
@@ -597,18 +667,26 @@ class ProjectStore:
                 "bge_used": search_res["bge_used"],
                 "total_candidates": search_res["total_candidates"],
                 "hit_count": len(search_res["hits"]),
+                "refused_missing_attrs": search_res["refused_missing_attrs"],
+                "evidence_count": min(len(search_res["hits"]), 5),
+                "scope": "候选片段检索，未检查全文",
             },
             mode=mode,
+            allow_external=llm["configured"],
         )
 
         now_time = datetime.now().strftime("%H:%M")
         now_full = _now_str()
         msg_id = uuid.uuid4().hex[:12]
         with self._conn() as conn:
-            conn.execute(
-                "INSERT OR REPLACE INTO query_cache(cache_key, revision, payload_json, created_at) VALUES (?, ?, ?, ?)",
-                (cache_sig, rev, json.dumps(answer_payload, ensure_ascii=False), now_full),
-            )
+            current_revision = conn.execute("SELECT value FROM settings WHERE key='_revision'").fetchone()[0]
+            if int(current_revision) == rev and (
+                not llm["configured"] or str(answer_payload.get("llm_provider", "")).startswith("企业模型（")
+            ):
+                conn.execute(
+                    "INSERT OR REPLACE INTO query_cache(cache_key, revision, payload_json, created_at) VALUES (?, ?, ?, ?)",
+                    (cache_sig, rev, json.dumps(answer_payload, ensure_ascii=False), now_full),
+                )
             conn.execute(
                 "INSERT INTO chat_messages(id, role, question, time_str, payload_json, created_at) VALUES (?, 'turn', ?, ?, ?, ?)",
                 (msg_id, q, now_time, json.dumps(answer_payload, ensure_ascii=False), now_full),
@@ -627,8 +705,10 @@ class ProjectStore:
             right_doc = conn.execute("SELECT * FROM documents WHERE id=?", (right_id,)).fetchone()
             if not left_doc or not right_doc:
                 raise KeyError("请选择两个有效的项目文档")
-            left_chunks = [dict(r) for r in conn.execute("SELECT * FROM chunks WHERE doc_id=? ORDER BY page, rowid", (left_id,))]
-            right_chunks = [dict(r) for r in conn.execute("SELECT * FROM chunks WHERE doc_id=? ORDER BY page, rowid", (right_id,))]
+            if not left_doc["indexed"] or not right_doc["indexed"]:
+                raise ValueError("请先重新解析未索引的文档，再进行原文对照。")
+            left_chunks = [dict(r) for r in conn.execute(CHUNKS_FOR_DISPLAY, (left_id,))]
+            right_chunks = [dict(r) for r in conn.execute(CHUNKS_FOR_DISPLAY, (right_id,))]
 
         all_sections = []
         for c in left_chunks + right_chunks:
@@ -779,7 +859,8 @@ class ProjectStore:
         if payload.get("citations"):
             ws.append(["引用编号", "文件名", "页码 / 章节", "原文摘录"])
             for c in payload["citations"]:
-                ws.append([f"[{c.get('index', '')}]", c.get("file_name", ""), f"第 {c.get('page', '')} 页 · {c.get('section', '')}", c.get("content", "")])
+                ws.append([f"[{c.get('index', '')}]", c.get("file_name", ""),
+                           c.get("location") or c.get("section", ""), c.get("content", "")])
         buf = io.BytesIO()
         wb.save(buf)
         safe_title = re.sub(r'[\\/:*?"<>|]+', "_", row["title"])[:32]
@@ -1080,12 +1161,13 @@ def create_web_app(runtime_root: Path | None = None) -> FastAPI:
         try:
             import fitz  # type: ignore
 
-            pdf = fitz.open(fp)
-            pg_idx = max(0, min(page - 1, len(pdf) - 1))
-            pix = pdf[pg_idx].get_pixmap(dpi=130)
-            png_bytes = pix.tobytes("png")
-            pdf.close()
+            with fitz.open(fp) as pdf:
+                if not 1 <= page <= len(pdf):
+                    raise HTTPException(404, "页码超出原始 PDF 范围")
+                png_bytes = pdf[page - 1].get_pixmap(dpi=130).tobytes("png")
             return StreamingResponse(io.BytesIO(png_bytes), media_type="image/png")
+        except HTTPException:
+            raise
         except Exception as err:
             raise HTTPException(500, f"渲染 PDF 原页失败: {err}") from None
 
@@ -1101,10 +1183,10 @@ def create_web_app(runtime_root: Path | None = None) -> FastAPI:
             return FileResponse(fp, filename=info["document"]["name"])
         text = "\n\n".join(f"--- {c['section']} (第 {c['page']} 页) ---\n{c['content']}" for c in info["chunks"])
         return HTMLResponse(
-            f"<!doctype html><html lang='zh-CN'><meta charset='utf-8'><title>{info['document']['name']}</title>"
+            f"<!doctype html><html lang='zh-CN'><meta charset='utf-8'><title>{escape(info['document']['name'])}</title>"
             f"<body style='font-family:Segoe UI,Microsoft YaHei,sans-serif;max-width:860px;margin:32px auto;padding:0 20px;line-height:1.8'>"
-            f"<h2>{info['document']['name']} ({info['document']['version']})</h2>"
-            f"<pre style='white-space:pre-wrap;background:#f8fafc;padding:20px;border-radius:10px;border:1px solid #e5e7eb'>{text}</pre></body></html>"
+            f"<h2>{escape(info['document']['name'])} ({escape(info['document']['version'])})</h2>"
+            f"<pre style='white-space:pre-wrap;background:#f8fafc;padding:20px;border-radius:10px;border:1px solid #e5e7eb'>{escape(text)}</pre></body></html>"
         )
 
     @api.get("/api/projects/{project_id}/chat/history")
@@ -1140,7 +1222,7 @@ def create_web_app(runtime_root: Path | None = None) -> FastAPI:
                 keyword=str(payload.get("keyword", "")),
                 sections=payload.get("sections"),
             )
-        except KeyError as err:
+        except (KeyError, ValueError) as err:
             raise HTTPException(400, str(err)) from None
 
     @api.get("/api/projects/{project_id}/saved")
@@ -1186,15 +1268,23 @@ def create_web_app(runtime_root: Path | None = None) -> FastAPI:
     def _build_runtime_status(store: ProjectStore, cfg: dict) -> dict:
         docs = store.list_documents()
         with store._conn() as conn:
-            chunk_cnt = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
-            vec_cnt = conn.execute("SELECT COUNT(*) FROM chunks WHERE embedding IS NOT NULL").fetchone()[0]
+            chunk_cnt, vec_cnt = conn.execute(
+                "SELECT COUNT(*), COUNT(c.embedding) FROM chunks c JOIN documents d ON d.id=c.doc_id WHERE d.indexed=1"
+            ).fetchone()
         emb = embedding_health()
         llm = llm_config_status()
+        binary = ("Scripts", "python.exe") if os.name == "nt" else ("bin", "python")
+        ocr_python = ocr_root().joinpath(".venv", *binary)
+        app_service = os.environ.get("RFQ_APP_SERVICE", "").casefold() in {"1", "true"}
+        interpreter_available = ocr_python.is_file() or (app_service and Path(sys.executable).is_file())
+        ocr_status = "已关闭"
+        if cfg.get("ocr_enabled"):
+            ocr_status = "已启用（按页识别）" if interpreter_available else "本地 OCR 未安装"
         return {
-            "model_api": llm["status_text"],
+            "model_api": llm["status_text"] if cfg.get("online_answers_enabled") is True else "本项目使用本地检索",
             "vector_service": "本地 BGE 512维就绪" if emb.get("ok") else "向量模型未就绪",
             "index_service": f"运行中（文档 {len(docs)} 篇 · 向量块 {vec_cnt}/{chunk_cnt}）",
-            "ocr_service": "运行中" if cfg.get("ocr_enabled") else "已关闭",
+            "ocr_service": ocr_status,
             "updated_at": _now_str(),
         }
 
@@ -1207,7 +1297,10 @@ def create_web_app(runtime_root: Path | None = None) -> FastAPI:
     @api.put("/api/projects/{project_id}/settings")
     def put_settings(project_id: str, payload: dict):
         store = get_store(project_id)
-        updated = store.update_settings(payload)
+        try:
+            updated = store.update_settings(payload)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from None
         return {"settings": updated, "status": _build_runtime_status(store, updated)}
 
     @api.post("/api/projects/{project_id}/backup")
