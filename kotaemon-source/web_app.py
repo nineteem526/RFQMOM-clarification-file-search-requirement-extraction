@@ -95,23 +95,77 @@ def _extract_text_from_file(
         raw_sections.append((1, "正文", text))
 
     elif suffix == ".pdf":
+        # P1: Structured PDF extraction using PyMuPDF (fitz) — preserves multi-column reading order & tables
+        extracted_pdf = False
         try:
-            import pypdf  # type: ignore
+            import fitz  # type: ignore
 
-            reader = pypdf.PdfReader(str(path))
-            for idx, page in enumerate(reader.pages, 1):
-                txt = (page.extract_text() or "").strip()
+            doc = fitz.open(str(path))
+            for idx, page in enumerate(doc, 1):
+                page_parts: list[str] = []
+                # 1. Extract structured tables with header-bound rows
+                try:
+                    tabs = page.find_tables()
+                    for t_idx, tab in enumerate(tabs.tables if tabs else [], 1):
+                        matrix = tab.extract() or []
+                        clean_rows = [
+                            [re.sub(r"\s+", " ", str(c or "")).strip() for c in r]
+                            for r in matrix
+                            if any(str(c or "").strip() for c in r)
+                        ]
+                        if not clean_rows:
+                            continue
+                        header = clean_rows[0]
+                        table_lines = [f"[表格 {t_idx}] " + " | ".join(h for h in header if h)]
+                        for r in clean_rows[1:]:
+                            paired = []
+                            for col_i, val in enumerate(r):
+                                if not val:
+                                    continue
+                                h_name = header[col_i] if col_i < len(header) and header[col_i] else f"列{col_i + 1}"
+                                paired.append(f"{h_name}: {val}" if h_name != val else val)
+                            if paired:
+                                table_lines.append(" | ".join(paired))
+                        if len(table_lines) > 1:
+                            raw_sections.append((idx, f"第 {idx} 页 · 表格 {t_idx}", "\n".join(table_lines)))
+                except Exception:
+                    pass
+
+                # 2. Extract reading-order text blocks (handles two-column manuals cleanly)
+                blocks = page.get_text("blocks", sort=True)
+                for b in blocks:
+                    b_txt = (b[4] or "").strip() if len(b) > 4 else ""
+                    if b_txt:
+                        page_parts.append(re.sub(r"[ \t]+", " ", b_txt))
+                txt = "\n\n".join(page_parts).strip()
+
                 if not txt and ocr_enabled:
                     try:
                         from local_ocr import ocr_pdf_page  # type: ignore
 
-                        txt = (ocr_pdf_page(path, idx - 1) or "").strip()
+                        ocr_txt = (ocr_pdf_page(path, idx - 1) or "").strip()
+                        if ocr_txt:
+                            txt = "[OCR识别，请核对原页]\n" + ocr_txt
                     except Exception:
                         txt = ""
                 if txt:
                     raw_sections.append((idx, f"第 {idx} 页", txt))
+            doc.close()
+            extracted_pdf = bool(raw_sections)
         except Exception:
-            pass
+            extracted_pdf = False
+
+        if not extracted_pdf:
+            try:
+                import pypdf  # type: ignore
+
+                reader = pypdf.PdfReader(str(path))
+                for idx, page in enumerate(reader.pages, 1):
+                    txt = (page.extract_text() or "").strip()
+                    if txt:
+                        raw_sections.append((idx, f"第 {idx} 页", txt))
+            except Exception:
+                pass
 
     elif suffix == ".docx":
         try:
@@ -140,10 +194,20 @@ def _extract_text_from_file(
             for s_idx, sheet_name in enumerate(wb.sheetnames, 1):
                 ws = wb[sheet_name]
                 rows = []
+                header = None
                 for row in ws.iter_rows(values_only=True):
                     vals = [str(c).strip() for c in row if c is not None and str(c).strip()]
-                    if vals:
-                        rows.append(" | ".join(vals))
+                    if not vals:
+                        continue
+                    if header is None:
+                        header = vals
+                        rows.append(f"[表头] " + " | ".join(header))
+                    else:
+                        paired = []
+                        for ci, val in enumerate(vals):
+                            hn = header[ci] if ci < len(header) else f"列{ci + 1}"
+                            paired.append(f"{hn}: {val}")
+                        rows.append(" | ".join(paired))
                 if rows:
                     raw_sections.append((s_idx, f"工作表 {sheet_name}", "\n".join(rows)))
         except Exception:
@@ -239,8 +303,15 @@ class ProjectStore:
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS query_cache (
+                    cache_key TEXT PRIMARY KEY,
+                    revision INTEGER NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
                 """
             )
+            conn.execute("INSERT OR IGNORE INTO settings(key, value) VALUES ('_revision', '1')")
             for idx, folder in enumerate(DEFAULT_FOLDERS):
                 conn.execute(
                     "INSERT OR IGNORE INTO folders(name, sort_order) VALUES (?, ?)",
@@ -278,6 +349,17 @@ class ProjectStore:
                     cfg[row["key"]] = row["value"]
         return cfg
 
+    def get_revision(self) -> int:
+        with self._conn() as conn:
+            row = conn.execute("SELECT value FROM settings WHERE key='_revision'").fetchone()
+            return int(row["value"]) if row and str(row["value"]).isdigit() else 1
+
+    def bump_revision(self):
+        rev = self.get_revision() + 1
+        with self._conn() as conn:
+            conn.execute("INSERT OR REPLACE INTO settings(key, value) VALUES ('_revision', ?)", (str(rev),))
+            conn.execute("DELETE FROM query_cache WHERE revision < ?", (rev,))
+
     def update_settings(self, patch: dict) -> dict:
         current = self.get_settings()
         for k, v in patch.items():
@@ -289,6 +371,7 @@ class ProjectStore:
                     "INSERT OR REPLACE INTO settings(key, value) VALUES (?, ?)",
                     (k, json.dumps(v, ensure_ascii=False)),
                 )
+        self.bump_revision()
         return current
 
     def list_folders(self) -> list[str]:
@@ -384,6 +467,7 @@ class ProjectStore:
                     "INSERT INTO chunks(id, doc_id, page, section, content, highlight, embedding) VALUES (?, ?, ?, ?, ?, '', ?)",
                     (f"{doc_id}-c{idx}", doc_id, item["page"], item["section"], item["content"], emb),
                 )
+        self.bump_revision()
         return self.get_document_preview(doc_id)["document"]
 
     def reparse_document(self, doc_id: str) -> dict:
@@ -419,6 +503,7 @@ class ProjectStore:
                     emb = self._embed_safe(r["content"])
                     conn.execute("UPDATE chunks SET embedding=? WHERE id=?", (emb, r["id"]))
                 conn.execute("UPDATE documents SET updated_at=?, status='已索引', indexed=1 WHERE id=?", (now, doc_id))
+        self.bump_revision()
         return self.get_document_preview(doc_id)
 
     def get_chat_history(self) -> list[dict]:
@@ -444,6 +529,38 @@ class ProjectStore:
         if not q:
             raise ValueError("请输入要查询的问题")
         cfg = self.get_settings()
+        rev = self.get_revision()
+        cache_sig = hashlib.sha256(
+            json.dumps({
+                "q": re.sub(r"\s+", " ", q).lower(),
+                "mode": mode,
+                "rm": cfg.get("retrieval_mode"),
+                "thr": cfg.get("similarity_threshold"),
+                "k": cfg.get("top_k"),
+                "rev": rev,
+            }, sort_keys=True, ensure_ascii=False).encode("utf-8")
+        ).hexdigest()
+
+        now_time = datetime.now().strftime("%H:%M")
+        now_full = _now_str()
+
+        with self._conn() as conn:
+            cached_row = conn.execute(
+                "SELECT payload_json, created_at FROM query_cache WHERE cache_key=? AND revision=?",
+                (cache_sig, rev),
+            ).fetchone()
+        if cached_row:
+            answer_payload = json.loads(cached_row["payload_json"])
+            answer_payload["cached"] = True
+            answer_payload["cached_from"] = cached_row["created_at"]
+            msg_id = uuid.uuid4().hex[:12]
+            with self._conn() as conn:
+                conn.execute(
+                    "INSERT INTO chat_messages(id, role, question, time_str, payload_json, created_at) VALUES (?, 'turn', ?, ?, ?, ?)",
+                    (msg_id, q, now_time, json.dumps(answer_payload, ensure_ascii=False), now_full),
+                )
+            return {"id": msg_id, "role": "turn", "question": q, "time": now_time, "payload": answer_payload}
+
         self.ensure_embeddings()
         with self._conn() as conn:
             rows = conn.execute(
@@ -488,6 +605,10 @@ class ProjectStore:
         now_full = _now_str()
         msg_id = uuid.uuid4().hex[:12]
         with self._conn() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO query_cache(cache_key, revision, payload_json, created_at) VALUES (?, ?, ?, ?)",
+                (cache_sig, rev, json.dumps(answer_payload, ensure_ascii=False), now_full),
+            )
             conn.execute(
                 "INSERT INTO chat_messages(id, role, question, time_str, payload_json, created_at) VALUES (?, 'turn', ?, ?, ?, ?)",
                 (msg_id, q, now_time, json.dumps(answer_payload, ensure_ascii=False), now_full),
@@ -945,6 +1066,28 @@ def create_web_app(runtime_root: Path | None = None) -> FastAPI:
             return store.reparse_document(doc_id)
         except KeyError as err:
             raise HTTPException(404, str(err)) from None
+
+    @api.get("/api/projects/{project_id}/documents/{doc_id}/page-image/{page}")
+    def document_page_image(project_id: str, doc_id: str, page: int):
+        store = get_store(project_id)
+        try:
+            info = store.get_document_preview(doc_id)
+        except KeyError as err:
+            raise HTTPException(404, str(err)) from None
+        fp = info["document"].get("file_path")
+        if not fp or not Path(fp).exists() or Path(fp).suffix.lower() != ".pdf":
+            raise HTTPException(404, "仅本地已上传的 PDF 文件支持原页图像预览")
+        try:
+            import fitz  # type: ignore
+
+            pdf = fitz.open(fp)
+            pg_idx = max(0, min(page - 1, len(pdf) - 1))
+            pix = pdf[pg_idx].get_pixmap(dpi=130)
+            png_bytes = pix.tobytes("png")
+            pdf.close()
+            return StreamingResponse(io.BytesIO(png_bytes), media_type="image/png")
+        except Exception as err:
+            raise HTTPException(500, f"渲染 PDF 原页失败: {err}") from None
 
     @api.get("/api/projects/{project_id}/source/{doc_id}")
     def download_source(project_id: str, doc_id: str):
