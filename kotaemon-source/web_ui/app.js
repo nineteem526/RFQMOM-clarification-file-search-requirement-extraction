@@ -806,9 +806,13 @@ function renderSavedDetail() {
 
 /* ==================== TAB 5: SETTINGS ==================== */
 async function loadSettings() {
-  const data = await api(`/api/projects/${encodeURIComponent(state.projectId)}/settings`);
+  const [data, llmData] = await Promise.all([
+    api(`/api/projects/${encodeURIComponent(state.projectId)}/settings`),
+    api("/api/llm-config"),
+  ]);
   state.settingsData = data.settings;
   state.statusData = data.status;
+  state.llmConfig = llmData.llm_config || {};
   syncSettingsForm();
   renderSettingsRightRail();
 }
@@ -816,6 +820,15 @@ async function loadSettings() {
 function syncSettingsForm() {
   const s = state.settingsData;
   if (!s) return;
+  const lc = state.llmConfig || {};
+  if ($("#cfg-llm-provider")) {
+    $("#cfg-llm-provider").value = lc.provider || "local";
+    $("#cfg-sf-model").value = lc.model || "";
+    $("#cfg-sf-key").value = "";
+    $("#cfg-sf-key-hint").textContent = lc.has_key
+      ? `已在本机保存密钥（${lc.key_mask}），留空即可保持不变；新输入将覆盖保存。`
+      : "尚未保存本机密钥；填写后点击“保存设置”即可永久保存在本机 AppData。";
+  }
   $("#cfg-chat-model").value = s.chat_model || "GPT-4o（企业内网）";
   $("#cfg-embed-model").value = s.embedding_model || "BAAI/bge-small-zh-v1.5（本地离线）";
   $("#cfg-retrieval-mode").value = s.retrieval_mode || "混合检索（语义 + 关键词）";
@@ -866,6 +879,18 @@ function renderSettingsRightRail() {
 }
 
 async function saveSettings() {
+  if ($("#cfg-llm-provider")) {
+    const llmRes = await api("/api/llm-config", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        provider: $("#cfg-llm-provider").value,
+        model: $("#cfg-sf-model").value.trim(),
+        api_key: $("#cfg-sf-key").value.trim(),
+      }),
+    });
+    state.llmConfig = llmRes.llm_config || {};
+  }
   const payload = readSettingsFromForm();
   const data = await api(`/api/projects/${encodeURIComponent(state.projectId)}/settings`, {
     method: "PUT",
@@ -874,8 +899,9 @@ async function saveSettings() {
   });
   state.settingsData = data.settings;
   state.statusData = data.status;
+  syncSettingsForm();
   renderSettingsRightRail();
-  showToast("当前项目设置已保存");
+  showToast("项目设置与本机 API 配置已长期保存");
 }
 
 async function triggerBackup() {

@@ -153,5 +153,27 @@ class SiliconFlowTests(unittest.TestCase):
         self.assertEqual(ans_json["diagnostic"]["code"], "invalid_json")
 
 
+    def test_local_persisted_llm_config_works_without_env_vars(self):
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg_file = Path(tmp) / "local_llm_config.json"
+            with patch.dict(os.environ, {"RFQ_LOCAL_LLM_CONFIG": str(cfg_file)}, clear=True):
+                saved = rag_engine.save_local_llm_config(
+                    "siliconflow", "deepseek-ai/DeepSeek-V4.1-Flash", "sk-demo1234567890"
+                )
+                self.assertTrue(saved["has_key"])
+                self.assertNotIn("demo123456", saved["key_mask"])
+                st = rag_engine.llm_config_status()
+                self.assertTrue(st["configured"])
+                self.assertEqual(st["provider"], "siliconflow")
+                self.assertEqual(st["model"], "deepseek-ai/DeepSeek-V4.1-Flash")
+                # Updating model with empty api_key keeps existing key intact
+                saved2 = rag_engine.save_local_llm_config("siliconflow", "deepseek-ai/DeepSeek-V3", "")
+                self.assertTrue(saved2["has_key"])
+                self.assertEqual(rag_engine.llm_config_status()["model"], "deepseek-ai/DeepSeek-V3")
+
+
 if __name__ == "__main__":
     unittest.main()

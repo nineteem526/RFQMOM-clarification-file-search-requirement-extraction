@@ -12,6 +12,7 @@ Provides:
 - Approved Company Azure LLM answer synthesis with deterministic local fallback
 """
 
+from pathlib import Path
 import json
 import math
 import os
@@ -239,12 +240,108 @@ def embedding_health() -> dict[str, Any]:
         return {"ok": False, "model": "BAAI/bge-small-zh-v1.5", "error": str(exc)}
 
 
-def llm_config_status() -> dict[str, Any]:
-    """Only the explicitly approved endpoint may receive source documents."""
-    provider = os.environ.get("RFQ_LLM_PROVIDER", "company-azure").strip().lower()
-    if provider == "siliconflow":
+def local_llm_config_path() -> Path:
+    """Return user-local private config path outside the Git repository."""
+    override = os.environ.get("RFQ_LOCAL_LLM_CONFIG", "").strip()
+    if override:
+        return Path(override)
+    from pilot_runtime import prepare_runtime
+
+    return prepare_runtime() / "local_llm_config.json"
+
+
+def _mask_key(key: str) -> str:
+    k = (key or "").strip()
+    if not k:
+        return ""
+    if len(k) <= 8:
+        return "*" * len(k)
+    return f"{k[:4]}****{k[-4:]}"
+
+
+def load_local_llm_config() -> dict[str, str]:
+    try:
+        path = local_llm_config_path()
+    except Exception:
+        return {}
+    if not path.is_file():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            return {
+                "provider": str(data.get("provider", "")).strip().lower(),
+                "siliconflow_model": str(data.get("siliconflow_model", "")).strip(),
+                "siliconflow_api_key": str(data.get("siliconflow_api_key", "")).strip(),
+            }
+    except Exception:
+        pass
+    return {}
+
+
+def save_local_llm_config(provider: str, model: str = "", api_key: str = "", clear_key: bool = False) -> dict[str, Any]:
+    """Persist LLM provider/model/key to user-local AppData (never inside Git repo)."""
+    existing = load_local_llm_config()
+    clean_provider = (provider or "").strip().lower()
+    if clean_provider not in {"", "siliconflow", "company-azure", "local"}:
+        raise ValueError("不支持的模型服务商类型。")
+    clean_model = (model or "").strip()
+    if clean_provider == "siliconflow" and clean_model and not re.fullmatch(r"[A-Za-z0-9._/-]+", clean_model):
+        raise ValueError("模型名称格式无效，仅允许字母、数字及 . _ / -")
+
+    clean_key = (api_key or "").strip()
+    if clean_key and (not clean_key.isascii() or "\r" in clean_key or "\n" in clean_key):
+        raise ValueError("API Key 包含非法字符。")
+
+    final_key = "" if clear_key else (clean_key or existing.get("siliconflow_api_key", ""))
+    record = {
+        "provider": clean_provider,
+        "siliconflow_model": clean_model or existing.get("siliconflow_model", ""),
+        "siliconflow_api_key": final_key,
+    }
+    path = local_llm_config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
+    return masked_local_llm_config()
+
+
+def masked_local_llm_config() -> dict[str, Any]:
+    saved = load_local_llm_config()
+    env_provider = os.environ.get("RFQ_LLM_PROVIDER", "").strip().lower()
+    env_key = os.environ.get("SILICONFLOW_API_KEY", "").strip()
+    env_model = os.environ.get("SILICONFLOW_MODEL", "").strip()
+    effective_provider = env_provider or saved.get("provider") or "local"
+    effective_model = env_model or saved.get("siliconflow_model") or ""
+    effective_key = env_key or saved.get("siliconflow_api_key") or ""
+    return {
+        "provider": effective_provider,
+        "model": effective_model,
+        "has_key": bool(effective_key),
+        "key_mask": _mask_key(effective_key),
+        "source": "env" if env_provider else ("local_file" if saved.get("provider") else "none"),
+        "config_path": str(local_llm_config_path()),
+    }
+
+
+def _resolve_siliconflow_credentials() -> tuple[str, str]:
+    """Resolve (api_key, model): explicit env vars take precedence, else local persisted config."""
+    saved = load_local_llm_config()
+    env_provider_set = "RFQ_LLM_PROVIDER" in os.environ
+    if env_provider_set:
         key = os.environ.get("SILICONFLOW_API_KEY", "")
         model = os.environ.get("SILICONFLOW_MODEL", "").strip()
+    else:
+        key = os.environ.get("SILICONFLOW_API_KEY") or saved.get("siliconflow_api_key", "")
+        model = (os.environ.get("SILICONFLOW_MODEL") or saved.get("siliconflow_model", "")).strip()
+    return key, model
+
+
+def llm_config_status() -> dict[str, Any]:
+    """Only the explicitly approved endpoint may receive source documents."""
+    saved = load_local_llm_config() if "RFQ_LLM_PROVIDER" not in os.environ else {}
+    provider = os.environ.get("RFQ_LLM_PROVIDER", saved.get("provider") or "company-azure").strip().lower()
+    if provider == "siliconflow":
+        key, model = _resolve_siliconflow_credentials()
         if key and key == key.strip() and key.isascii() and re.fullmatch(r"[A-Za-z0-9._/-]+", model):
             return {
                 "configured": True, "provider": "siliconflow", "model": model,
@@ -254,6 +351,13 @@ def llm_config_status() -> dict[str, Any]:
         return {
             "configured": False, "provider": "siliconflow", "model": model,
             "status_text": "硅基流动配置未就绪，请检查模型名和 API Key",
+        }
+    if provider == "local":
+        return {
+            "configured": False,
+            "provider": "local-fallback",
+            "model": "本地检索汇总（未配置在线 API）",
+            "status_text": "本地检索模式（未启用在线接口）",
         }
     if provider != "company-azure":
         return {
@@ -852,8 +956,9 @@ def _call_external_llm(
             from openai import OpenAI
 
             with httpx.Client(follow_redirects=False, timeout=60.0) as http_client:
+                sf_key, _sf_model = _resolve_siliconflow_credentials()
                 client = OpenAI(
-                    api_key=os.environ["SILICONFLOW_API_KEY"],
+                    api_key=sf_key,
                     base_url="https://api.siliconflow.cn/v1",
                     http_client=http_client,
                     max_retries=0,

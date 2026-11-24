@@ -36,7 +36,9 @@ from rag_engine import (
     generate_structured_answer,
     hybrid_search,
     llm_config_status,
+    masked_local_llm_config,
     pack_vector,
+    save_local_llm_config,
     split_text_with_overlap,
 )
 
@@ -1308,6 +1310,23 @@ def create_web_app(runtime_root: Path | None = None) -> FastAPI:
             "ocr_service": ocr_status,
             "updated_at": _now_str(),
         }
+
+    @api.get("/api/llm-config")
+    def get_llm_config():
+        return {"llm_config": masked_local_llm_config(), "llm_status": llm_config_status()}
+
+    @api.put("/api/llm-config")
+    def put_llm_config(payload: dict):
+        try:
+            saved = save_local_llm_config(
+                provider=str(payload.get("provider", "")),
+                model=str(payload.get("model", "")),
+                api_key=str(payload.get("api_key", "")),
+                clear_key=bool(payload.get("clear_key", False)),
+            )
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from None
+        return {"llm_config": saved, "llm_status": llm_config_status()}
 
     @api.get("/api/projects/{project_id}/settings")
     def get_settings(project_id: str):

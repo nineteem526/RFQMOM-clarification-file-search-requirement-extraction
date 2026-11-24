@@ -323,6 +323,31 @@
               <h2>模型与接口</h2>
               <p class="settings-desc">配置用于当前项目问答和检索的模型与接口，支持对接企业自有模型或第三方服务。</p>
               <div class="form-row">
+                <label class="form-label">本机接口服务商</label>
+                <div class="form-control">
+                  <select id="cfg-llm-provider" class="form-select">
+                    <option value="siliconflow">硅基流动（SiliconFlow）</option>
+                    <option value="company-azure">企业内网模型（Azure）</option>
+                    <option value="local">仅本地检索（不调用在线接口）</option>
+                  </select>
+                  <div class="form-help">保存到本机私有配置目录（AppData），永久生效且不会上传至 Git 仓库。</div>
+                </div>
+              </div>
+              <div class="form-row">
+                <label class="form-label">硅基流动模型 ID</label>
+                <div class="form-control">
+                  <input type="text" id="cfg-sf-model" class="form-input" placeholder="例如：deepseek-ai/DeepSeek-V4.1-Flash" autocomplete="off" />
+                  <div class="form-help">填写硅基流动平台上的准确模型名称，切换后点击下方“保存设置”立即生效。</div>
+                </div>
+              </div>
+              <div class="form-row">
+                <label class="form-label">硅基流动 API Key</label>
+                <div class="form-control">
+                  <input type="password" id="cfg-sf-key" class="form-input" placeholder="输入一次永久保存在本机（留空表示保持已存密钥不变）" autocomplete="new-password" />
+                  <div class="form-help" id="cfg-sf-key-hint">仅写入本机 AppData 私有文件，网页不回显明文密钥。</div>
+                </div>
+              </div>
+              <div class="form-row">
                 <label class="form-label"><span class="req">*</span> 回答模型</label>
                 <div class="form-control">
                   <select id="cfg-chat-model" class="form-select">
