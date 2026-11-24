@@ -1651,3 +1651,114 @@ body.is-resizing {
   flex: 1;
   min-width: 140px;
 }
+
+/* ==================== MULTI-MODAL CHUNK & REPARSE UI ==================== */
+.preview-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.pending-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 14px;
+  margin-bottom: 12px;
+  border-radius: var(--radius);
+  background: #fffbeb;
+  border: 1px solid #fde68a;
+  color: #92400e;
+  font-size: 13px;
+  font-weight: 500;
+  flex-shrink: 0;
+}
+
+.status-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 8px;
+  border-radius: 99px;
+  font-size: 11.5px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+.status-badge.ok {
+  background: #dcfce7;
+  color: #166534;
+}
+.status-badge.warn {
+  background: #fef3c7;
+  color: #92400e;
+}
+.status-badge.err {
+  background: #fee2e2;
+  color: #991b1b;
+}
+
+.chunk-nav-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 8px;
+  flex-shrink: 0;
+}
+.chunk-nav-controls {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.chunk-meta-strip {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+  font-size: 12px;
+  color: var(--muted);
+  flex-shrink: 0;
+  overflow: hidden;
+}
+.chunk-sec-tag {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chunk-type-pill {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 7px;
+  border-radius: 99px;
+  font-size: 11px;
+  font-weight: 600;
+  flex-shrink: 0;
+}
+.chunk-type-pill.text {
+  background: var(--blue-soft);
+  color: var(--blue);
+}
+.chunk-type-pill.table {
+  background: #ecfeff;
+  color: #0e7490;
+}
+.chunk-type-pill.ocr {
+  background: #fef3c7;
+  color: #b45309;
+}
+
+.page-img-wrap {
+  display: flex;
+  justify-content: center;
+  align-items: flex-start;
+}
+.page-preview-img {
+  max-width: 100%;
+  height: auto;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: #ffffff;
+}

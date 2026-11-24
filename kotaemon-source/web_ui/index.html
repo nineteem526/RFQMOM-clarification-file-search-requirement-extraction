@@ -94,6 +94,7 @@
               </div>
               <div class="preview-footer">
                 <a class="link-primary" id="qa-open-full-file" href="#" target="_blank" rel="noopener">查看完整文件</a>
+                <button class="btn-secondary btn-xs hidden" id="qa-toggle-page-img" type="button">原页图像</button>
               </div>
             </div>
 
@@ -128,6 +129,8 @@
               </div>
               <div class="docs-actions">
                 <button class="btn-primary" id="btn-open-upload" type="button">上传资料</button>
+                <button class="btn-secondary hidden" id="btn-reparse-pending" type="button">一键重解析待更新</button>
+                <button class="btn-secondary" id="btn-reparse-all" type="button">全部重解析</button>
                 <button class="btn-secondary" id="btn-open-folder" type="button">新建文件夹</button>
                 <button class="btn-secondary" id="btn-refresh-docs" type="button">刷新</button>
               </div>
@@ -139,15 +142,20 @@
                 <input type="text" id="docs-file-search" placeholder="筛选文件名" autocomplete="off" />
               </div>
             </div>
+            <div class="pending-banner hidden" id="docs-pending-banner">
+              <span id="docs-pending-text">检测到待重新解析文档，完成解析后即可查看切块并参与检索。</span>
+              <button class="btn-primary btn-xs" id="btn-banner-reparse-pending" type="button">一键重新解析</button>
+            </div>
             <div class="table-container">
               <table class="data-table">
                 <thead>
                   <tr>
                     <th>文件名</th>
-                    <th style="width: 78px;">类型</th>
-                    <th style="width: 82px;">版本</th>
-                    <th style="width: 156px;">更新时间 ⌄</th>
-                    <th style="width: 108px;">状态</th>
+                    <th style="width: 72px;">类型</th>
+                    <th style="width: 74px;">切块</th>
+                    <th style="width: 78px;">版本</th>
+                    <th style="width: 148px;">更新时间 ⌄</th>
+                    <th style="width: 118px;">状态</th>
                   </tr>
                 </thead>
                 <tbody id="docs-table-body"></tbody>
@@ -173,7 +181,18 @@
               </div>
             </div>
             <dl class="kv-grid" id="detail-kv-grid"></dl>
-            <div class="section-subtitle">内容预览</div>
+            <div class="chunk-nav-row">
+              <div class="section-subtitle" style="margin-bottom:0;">内容预览</div>
+              <div class="chunk-nav-controls">
+                <button class="btn-secondary btn-xs hidden" id="detail-toggle-page-img" type="button">原页图像</button>
+                <div class="pager-controls">
+                  <button class="pager-btn" id="detail-prev-chunk" type="button" aria-label="上一块">&lt;</button>
+                  <span class="pager-indicator" id="detail-chunk-indicator">- / -</span>
+                  <button class="pager-btn" id="detail-next-chunk" type="button" aria-label="下一块">&gt;</button>
+                </div>
+              </div>
+            </div>
+            <div class="chunk-meta-strip hidden" id="detail-chunk-meta"></div>
             <div class="preview-card preview-card-compact">
               <div class="preview-card-body" id="detail-preview-body"></div>
             </div>
@@ -521,8 +540,9 @@
           <input type="text" id="upload-version-input" class="form-input" value="Rev.A" placeholder="例如：Rev.A / Rev.0" />
         </div>
         <div class="modal-field">
-          <label>选择工程文档（PDF / DOCX / XLSX / TXT / MD）</label>
+          <label>选择工程文档（PDF / 图片 / Word / Excel / HTML / TXT / MD）</label>
           <input type="file" id="upload-file-input" class="form-input" multiple />
+          <div class="form-help">PDF 自动按章节、表格与 OCR 分类切片；支持扫描件、图片及旧版 DOC/XLS。</div>
         </div>
       </div>
       <div class="modal-footer">

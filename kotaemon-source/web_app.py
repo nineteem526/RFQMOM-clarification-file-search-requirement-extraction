@@ -31,6 +31,12 @@ import uvicorn
 
 from pilot_runtime import prepare_runtime
 from runtime_paths import ocr_root
+from document_chunker import (
+    IMAGE_SUFFIXES,
+    ParsedDocument,
+    bind_table_row as _bind_table_row,
+    parse_document as _parse_document_impl,
+)
 from rag_engine import (
     embed_text,
     embedding_health,
@@ -70,7 +76,8 @@ QUERY_CACHE_FORMAT = 3
 QUERY_MODES = {"快速问答": 0, "扩展候选检索": 12, "更多候选检索": 20}
 LEGACY_QUERY_MODES = {"主题逐文件检查": "扩展候选检索", "深度全文检查": "更多候选检索"}
 CHUNKS_FOR_DISPLAY = (
-    "SELECT id, doc_id, page, section, content, highlight FROM chunks "
+    "SELECT id, doc_id, page, section, content, highlight, "
+    "COALESCE(chunk_type, 'text') AS chunk_type FROM chunks "
     "WHERE doc_id=? ORDER BY page, rowid"
 )
 
@@ -99,162 +106,19 @@ def _format_size(num_bytes: int) -> str:
     return f"{num_bytes} B"
 
 
-@dataclass
-class ParsedDocument:
-    chunks: list[dict]
-    pages: int
-    warnings: list[str]
-
-
 def _parse_document(
     path: Path,
     chunk_size: int = 480,
     chunk_overlap: int = 64,
     ocr_enabled: bool = True,
 ) -> ParsedDocument:
-    """Extract readable text pages/sections locally with overlap-aware chunking."""
-    suffix = path.suffix.lower()
-    raw_sections: list[tuple[int, str, str]] = []
-    warnings = []
-    pages = 0
-
-    def add_pdf_page(number, text):
-        if not text and ocr_enabled:
-            try:
-                from local_ocr import recognize_page
-
-                lines = recognize_page(path, number)
-                text = "\n".join(line["text"].strip() for line in lines if line["text"].strip())
-                if text:
-                    text = "[OCR识别，请核对原页]\n" + text
-                    warnings.append(f"第 {number} 页使用本地 OCR，引用需核对原页。")
-            except (ValueError, OSError) as exc:
-                warnings.append(f"第 {number} 页 OCR 失败（{type(exc).__name__}）：{exc}")
-        if text:
-            raw_sections.append((number, f"第 {number} 页", text))
-        else:
-            warnings.append(f"第 {number} 页没有可索引文本。")
-
-    if suffix in {".txt", ".md", ".csv", ".json", ".log"}:
-        try:
-            text = path.read_text(encoding="utf-8-sig")
-            raw_sections.append((1, "正文", text))
-        except (OSError, UnicodeError) as exc:
-            warnings.append(f"文本读取失败（{type(exc).__name__}）。")
-
-    elif suffix == ".pdf":
-        # P1: Structured PDF extraction using PyMuPDF (fitz) — preserves multi-column reading order & tables
-        try:
-            import fitz  # type: ignore
-
-            with fitz.open(path) as doc:
-                if not doc.is_pdf or doc.needs_pass:
-                    raise ValueError("PDF 格式无效或已加密。")
-                pages = len(doc)
-                for idx, page in enumerate(doc, 1):
-                    try:
-                        _append_pdf_text(page, idx, raw_sections, warnings, add_pdf_page)
-                    except (RuntimeError, ValueError, OSError) as exc:
-                        warnings.append(f"第 {idx} 页解析失败（{type(exc).__name__}），请核对原件。")
-        except (ImportError, RuntimeError, ValueError, OSError):
-            # The fallback reads the same file. Discard any partial first attempt.
-            raw_sections.clear()
-            warnings.clear()
-            pages = 0
-            try:
-                import pypdf
-
-                reader = pypdf.PdfReader(path)
-                if reader.is_encrypted:
-                    raise ValueError("PDF 已加密。")
-                pages = len(reader.pages)
-                warnings.append("PDF 使用备用文本解析，未提取结构化表格。")
-                for idx, page in enumerate(reader.pages, 1):
-                    try:
-                        add_pdf_page(idx, (page.extract_text() or "").strip())
-                    except (pypdf.errors.PyPdfError, ValueError, OSError) as exc:
-                        warnings.append(f"第 {idx} 页解析失败（{type(exc).__name__}），请核对原件。")
-            except Exception:
-                warnings.append("PDF 无法读取或已加密，请核对原件。")
-
-    elif suffix == ".docx":
-        try:
-            import docx  # type: ignore
-
-            document = docx.Document(str(path))
-            full_text = "\n\n".join(p.text.strip() for p in document.paragraphs if p.text.strip())
-            if full_text:
-                raw_sections.append((1, "Word 正文", full_text))
-            for t_idx, table in enumerate(document.tables, 1):
-                t_rows = []
-                for row in table.rows:
-                    vals = [cell.text.strip().replace("\n", " ") for cell in row.cells]
-                    if any(vals):
-                        t_rows.append(" | ".join(vals))
-                if t_rows:
-                    raw_sections.append((t_idx + 1, f"表格 {t_idx}", "\n".join(t_rows)))
-        except Exception as exc:
-            warnings.append(f"Word 解析中断（{type(exc).__name__}），请核对原件。")
-
-    elif suffix in {".xlsx", ".xlsm"}:
-        try:
-            import openpyxl  # type: ignore
-
-            with closing(openpyxl.load_workbook(path, data_only=True, read_only=True)) as wb:
-                for s_idx, sheet_name in enumerate(wb.sheetnames, 1):
-                    matrix = (
-                        ["" if cell is None else str(cell).strip() for cell in row]
-                        for row in wb[sheet_name].iter_rows(values_only=True)
-                    )
-                    header = next((row for row in matrix if any(row)), [])
-                    if not header:
-                        continue
-                    rows = ["[表头] " + " | ".join(header)]
-                    rows.extend(line for row in matrix if (line := _bind_table_row(header, row)))
-                    raw_sections.append((s_idx, f"工作表 {sheet_name}", "\n".join(rows)))
-        except Exception as exc:
-            warnings.append(f"Excel 解析中断（{type(exc).__name__}），请核对原件。")
-    else:
-        warnings.append("此文件格式暂无本地解析器。")
-
-    chunks: list[dict] = []
-    for page_no, sec_name, body in raw_sections:
-        parts = split_text_with_overlap(body, chunk_size=chunk_size, chunk_overlap=chunk_overlap)
-        for p_idx, part in enumerate(parts, 1):
-            label = sec_name if len(parts) == 1 else f"{sec_name} ({p_idx}/{len(parts)})"
-            chunks.append({"page": page_no, "section": label, "content": part})
-
-    if not chunks and not warnings:
-        warnings.append("文件没有可索引文本。")
-    return ParsedDocument(chunks, pages, warnings)
-
-
-def _bind_table_row(header, row):
-    parts = []
-    for column, value in enumerate(row):
-        if value:
-            name = (header[column] if column < len(header) else "") or f"列{column + 1}"
-            parts.append(f"{name}: {value}" if name != value else value)
-    return " | ".join(parts)
-
-
-def _append_pdf_text(page, number, sections, warnings, add_pdf_page):
-    try:
-        for index, table in enumerate(page.find_tables().tables, 1):
-            rows = [
-                [re.sub(r"\s+", " ", str(c or "")).strip() for c in row]
-                for row in table.extract() or [] if any(str(c or "").strip() for c in row)
-            ]
-            if len(rows) > 1:
-                header = rows[0]
-                lines = [f"[表格 {index}] " + " | ".join(c for c in header if c)]
-                lines.extend(_bind_table_row(header, row) for row in rows[1:])
-                sections.append((number, f"第 {number} 页 · 表格 {index}", "\n".join(lines)))
-    except Exception as exc:
-        warnings.append(f"第 {number} 页表格解析失败（{type(exc).__name__}），请核对原件。")
-    blocks = (re.sub(r"[ \t]+", " ", block[4].strip()) for block in page.get_text("blocks", sort=True)
-              if len(block) > 6 and block[6] == 0 and block[4].strip())
-    add_pdf_page(number, "\n\n".join(blocks))
+    """Extract readable text/table/OCR chunks using specialized per-format parsers."""
+    return _parse_document_impl(
+        path,
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap,
+        ocr_enabled=ocr_enabled,
+    )
 
 
 def _extract_text_from_file(path: Path, chunk_size=480, chunk_overlap=64, ocr_enabled=True) -> list[dict]:
@@ -315,6 +179,7 @@ class ProjectStore:
                     section TEXT DEFAULT '',
                     content TEXT NOT NULL,
                     highlight TEXT DEFAULT '',
+                    chunk_type TEXT DEFAULT 'text',
                     embedding BLOB DEFAULT NULL,
                     FOREIGN KEY(doc_id) REFERENCES documents(id) ON DELETE CASCADE
                 );
@@ -353,10 +218,12 @@ class ProjectStore:
                     "INSERT OR IGNORE INTO folders(name, sort_order) VALUES (?, ?)",
                     (folder, idx),
                 )
-            # Migrate existing project databases cleanly if embedding column is missing
+            # Migrate existing project databases cleanly if embedding or chunk_type column is missing
             cols = {row["name"] for row in conn.execute("PRAGMA table_info(chunks)")}
             if "embedding" not in cols:
                 conn.execute("ALTER TABLE chunks ADD COLUMN embedding BLOB DEFAULT NULL")
+            if "chunk_type" not in cols:
+                conn.execute("ALTER TABLE chunks ADD COLUMN chunk_type TEXT DEFAULT 'text'")
             doc_cols = {row["name"] for row in conn.execute("PRAGMA table_info(documents)")}
             if "parse_warnings" not in doc_cols:
                 conn.execute("ALTER TABLE documents ADD COLUMN parse_warnings TEXT DEFAULT '[]'")
@@ -450,9 +317,19 @@ class ProjectStore:
     def list_documents(self) -> list[dict]:
         with self._conn() as conn:
             rows = conn.execute(
-                "SELECT * FROM documents ORDER BY updated_at DESC, name ASC"
+                """
+                SELECT d.*, (SELECT COUNT(*) FROM chunks c WHERE c.doc_id = d.id) AS raw_chunk_count
+                FROM documents d
+                ORDER BY d.updated_at DESC, d.name ASC
+                """
             ).fetchall()
-            return [self._document_dict(r) for r in rows]
+            result = []
+            for r in rows:
+                doc = self._document_dict(r)
+                raw_cnt = int(doc.pop("raw_chunk_count", 0) or 0)
+                doc["chunk_count"] = raw_cnt if doc.get("indexed") else 0
+                result.append(doc)
+            return result
 
     @staticmethod
     def _document_dict(row):
@@ -473,6 +350,17 @@ class ProjectStore:
             ] if doc["indexed"] else []
         doc_dict = self._document_dict(doc)
         total_chunks = len(chunks)
+        doc_dict["chunk_count"] = total_chunks
+        chunk_summary = {
+            "total": total_chunks,
+            "text": sum(1 for c in chunks if (c.get("chunk_type") or "text") == "text"),
+            "table": sum(1 for c in chunks if c.get("chunk_type") == "table"),
+            "ocr": sum(1 for c in chunks if c.get("chunk_type") == "ocr"),
+        }
+        fp = doc_dict.get("file_path") or ""
+        can_preview_image = bool(
+            fp and Path(fp).exists() and Path(fp).suffix.lower() in ({".pdf"} | IMAGE_SUFFIXES)
+        )
         selected_chunk = None
         if page is not None:
             selected_chunk = next((c for c in chunks if c["page"] == page), None)
@@ -483,6 +371,8 @@ class ProjectStore:
             "chunks": chunks,
             "active_chunk": selected_chunk,
             "total_chunks": total_chunks,
+            "chunk_summary": chunk_summary,
+            "can_preview_image": can_preview_image,
         }
 
     def _embed_safe(self, text: str) -> bytes | None:
@@ -513,6 +403,22 @@ class ProjectStore:
         status = "解析失败" if not parsed.chunks else ("部分索引，需核对" if parsed.warnings else "已索引")
         return status, int(bool(parsed.chunks)), json.dumps(parsed.warnings, ensure_ascii=False)
 
+    def _store_parsed_chunks(self, conn, doc_id: str, chunks: list[dict]):
+        for idx, item in enumerate(chunks, 1):
+            emb = self._embed_safe(item["content"])
+            conn.execute(
+                "INSERT INTO chunks(id, doc_id, page, section, content, highlight, chunk_type, embedding) VALUES (?, ?, ?, ?, ?, '', ?, ?)",
+                (
+                    f"{doc_id}-c{idx}",
+                    doc_id,
+                    item["page"],
+                    item["section"],
+                    item["content"],
+                    item.get("chunk_type", "text"),
+                    emb,
+                ),
+            )
+
     def ingest_upload(self, filename: str, content: bytes, folder: str, version: str = "Rev.0") -> dict:
         safe_name = Path(filename).name
         if not safe_name:
@@ -541,12 +447,7 @@ class ProjectStore:
                 (doc_id, safe_name, folder, ext, version or "Rev.0", parsed.pages, len(content), now,
                  *self._parse_state(parsed), str(target), sha),
             )
-            for idx, item in enumerate(parsed.chunks, 1):
-                emb = self._embed_safe(item["content"])
-                conn.execute(
-                    "INSERT INTO chunks(id, doc_id, page, section, content, highlight, embedding) VALUES (?, ?, ?, ?, ?, '', ?)",
-                    (f"{doc_id}-c{idx}", doc_id, item["page"], item["section"], item["content"], emb),
-                )
+            self._store_parsed_chunks(conn, doc_id, parsed.chunks)
             self._bump_revision(conn)
         return self.get_document_preview(doc_id)["document"]
 
@@ -566,12 +467,7 @@ class ProjectStore:
                     ocr_enabled=bool(cfg.get("ocr_enabled", True)),
                 )
                 conn.execute("DELETE FROM chunks WHERE doc_id=?", (doc_id,))
-                for idx, item in enumerate(parsed.chunks, 1):
-                    emb = self._embed_safe(item["content"])
-                    conn.execute(
-                        "INSERT INTO chunks(id, doc_id, page, section, content, highlight, embedding) VALUES (?, ?, ?, ?, ?, '', ?)",
-                        (f"{doc_id}-c{idx}", doc_id, item["page"], item["section"], item["content"], emb),
-                    )
+                self._store_parsed_chunks(conn, doc_id, parsed.chunks)
                 conn.execute(
                     "UPDATE documents SET pages=?, updated_at=?, status=?, indexed=?, parse_warnings=? WHERE id=?",
                     (parsed.pages, now, *self._parse_state(parsed), doc_id),
@@ -590,6 +486,45 @@ class ProjectStore:
                 )
             self._bump_revision(conn)
         return self.get_document_preview(doc_id)
+
+    def reparse_batch(self, only_pending: bool = True) -> dict:
+        with self._conn() as conn:
+            if only_pending:
+                rows = conn.execute(
+                    "SELECT id FROM documents WHERE file_path <> '' "
+                    "AND (indexed = 0 OR status IN ('待重新解析', '解析失败')) ORDER BY updated_at DESC"
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT id FROM documents WHERE file_path <> '' ORDER BY updated_at DESC"
+                ).fetchall()
+        doc_ids = [r["id"] for r in rows]
+        results = []
+        indexed = partial = failed = 0
+        for doc_id in doc_ids:
+            preview = self.reparse_document(doc_id)
+            doc = preview["document"]
+            st = doc.get("status", "")
+            if st == "已索引":
+                indexed += 1
+            elif st == "部分索引，需核对":
+                partial += 1
+            else:
+                failed += 1
+            results.append({
+                "id": doc_id,
+                "name": doc.get("name", ""),
+                "status": st,
+                "chunk_count": preview.get("total_chunks", 0),
+                "pages": doc.get("pages", 0),
+            })
+        return {
+            "processed": len(doc_ids),
+            "indexed": indexed,
+            "partial": partial,
+            "failed": failed,
+            "results": results,
+        }
 
     def get_chat_history(self) -> list[dict]:
         with self._conn() as conn:
@@ -896,10 +831,46 @@ class ProjectStore:
         }
 
 
+def _backfill_demo_chunks(store: ProjectStore):
+    """Ensure every seeded synthetic demo document (with file_path == '') has previewable chunks."""
+    extra_demo_chunks = [
+        ("chk-rfq0-1", "doc-rfq-0", 11, "2.1 供货范围", "2.1  Scope of Supply\n\n2.1.1  Supplier shall design, manufacture and deliver the complete automation control cabinet system.", "Scope of Supply", "text"),
+        ("chk-tech-1", "doc-rfq-tech", 8, "3.2 环境条件", "3.2  Environmental Conditions\n\n3.2.1  Ambient temperature: 0 °C to +45 °C; Relative humidity <= 85% non-condensing.", "0 °C to +45 °C", "text"),
+        ("chk-draw-1", "doc-rfq-draw", 4, "第 4 页 · 图纸说明", "[图纸说明] 主电气控制柜外形尺寸：800 mm (W) × 600 mm (D) × 2200 mm (H)，底部进线。", "2200 mm (H)", "ocr"),
+        ("chk-eval-1", "doc-rfq-eval", 3, "第 3 页 · 表格 1", "[表格 1] 评审项 | 权重 | 评分标准\n评审项: 技术响应偏离 | 权重: 45% | 评分标准: 满足所有强制电气与防护条款", "45%", "table"),
+        ("chk-b12p-1", "doc-b12-param", 5, "第 5 页 · 表格 1", "[表格 1] 参数名称 | 设计要求 | 备注\n参数名称: 供电电源 | 设计要求: 380V AC / 24V DC | 备注: 含双路冗余", "380V AC / 24V DC", "table"),
+        ("chk-clar01-1", "doc-clar-01", 2, "澄清条目 Q&A-04", "Q-04: 控制柜备用端子数量要求？\nA-04: 每一排端子排应至少预留 20% 备用端子。", "20% 备用端子", "text"),
+        ("chk-mom-te-1", "doc-mom-te", 2, "第 2 页 · 技术会议纪要", "会议决议 TE-02：现场接线盒与主柜之间采用屏蔽控制电缆，接地电阻 <= 4 Ω。", "<= 4 Ω", "text"),
+        ("chk-mom-df-1", "doc-mom-df", 3, "第 3 页 · 设计冻结纪要", "设计冻结项 DF-05：所有铭牌采用中英文双语激光蚀刻不锈钢材质。", "中英文双语", "text"),
+        ("chk-xparam-1", "doc-xlsx-param", 1, "工作表 电气参数", "[表头] 编号 | 参数项 | 设定值 | 单位\n编号: P-01 | 参数项: 额定绝缘电压 | 设定值: 690 | 单位: V", "690", "table"),
+        ("chk-xequip-1", "doc-xlsx-equip", 1, "工作表 设备清单", "[表头] 位号 | 设备名称 | 数量 | 防护等级\n位号: CAB-01 | 设备名称: 主控PLC柜 | 数量: 2 | 防护等级: IP54", "IP54", "table"),
+    ]
+    seeded_ids = tuple({row[1] for row in extra_demo_chunks})
+    placeholders = ",".join("?" for _ in seeded_ids)
+    with store._conn() as conn:
+        missing_targets = {
+            r[0]
+            for r in conn.execute(
+                f"SELECT d.id FROM documents d WHERE d.file_path = '' AND d.id IN ({placeholders}) "
+                "AND NOT EXISTS (SELECT 1 FROM chunks c WHERE c.doc_id = d.id)",
+                seeded_ids,
+            )
+        }
+        if missing_targets:
+            for c in extra_demo_chunks:
+                if c[1] in missing_targets:
+                    conn.execute(
+                        "INSERT OR IGNORE INTO chunks(id, doc_id, page, section, content, highlight, chunk_type) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        c,
+                    )
+            store._bump_revision(conn)
+
+
 def seed_demo_project(runtime_root: Path):
     """Seed a clean synthetic demo project matching the 5 prototype screens (no real company data)."""
     store = ProjectStore(runtime_root, "rfq-demo")
     if store.list_documents():
+        _backfill_demo_chunks(store)
         return
     store.save_meta({
         "id": "rfq-demo",
@@ -1048,6 +1019,7 @@ def seed_demo_project(runtime_root: Path):
                 "INSERT OR IGNORE INTO saved_items(id, kind, title, summary, sources_text, created_at, payload_json) VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (s[0], s[1], s[2], s[3], s[4], s[5], json.dumps(s[6], ensure_ascii=False)),
             )
+    _backfill_demo_chunks(store)
 
 
 def create_web_app(runtime_root: Path | None = None) -> FastAPI:
@@ -1157,6 +1129,12 @@ def create_web_app(runtime_root: Path | None = None) -> FastAPI:
         except KeyError as err:
             raise HTTPException(404, str(err)) from None
 
+    @api.post("/api/projects/{project_id}/documents/reparse-all")
+    def reparse_all_documents(project_id: str, payload: dict | None = None):
+        store = get_store(project_id)
+        only_pending = bool((payload or {}).get("only_pending", True))
+        return store.reparse_batch(only_pending=only_pending)
+
     @api.post("/api/projects/{project_id}/documents/{doc_id}/reparse")
     def reparse_document(project_id: str, doc_id: str):
         store = get_store(project_id)
@@ -1173,20 +1151,43 @@ def create_web_app(runtime_root: Path | None = None) -> FastAPI:
         except KeyError as err:
             raise HTTPException(404, str(err)) from None
         fp = info["document"].get("file_path")
-        if not fp or not Path(fp).exists() or Path(fp).suffix.lower() != ".pdf":
-            raise HTTPException(404, "仅本地已上传的 PDF 文件支持原页图像预览")
-        try:
-            import fitz  # type: ignore
+        if not fp or not Path(fp).exists():
+            raise HTTPException(404, "仅本地已上传的 PDF 或图片文件支持图像预览")
+        src = Path(fp)
+        suffix = src.suffix.lower()
+        if suffix == ".pdf":
+            try:
+                import fitz  # type: ignore
 
-            with fitz.open(fp) as pdf:
-                if not 1 <= page <= len(pdf):
-                    raise HTTPException(404, "页码超出原始 PDF 范围")
-                png_bytes = pdf[page - 1].get_pixmap(dpi=130).tobytes("png")
-            return StreamingResponse(io.BytesIO(png_bytes), media_type="image/png")
-        except HTTPException:
-            raise
-        except Exception as err:
-            raise HTTPException(500, f"渲染 PDF 原页失败: {err}") from None
+                with fitz.open(fp) as pdf:
+                    if not 1 <= page <= len(pdf):
+                        raise HTTPException(404, "页码超出原始 PDF 范围")
+                    png_bytes = pdf[page - 1].get_pixmap(dpi=130).tobytes("png")
+                return StreamingResponse(io.BytesIO(png_bytes), media_type="image/png")
+            except HTTPException:
+                raise
+            except Exception as err:
+                raise HTTPException(500, f"渲染 PDF 原页失败: {err}") from None
+        if suffix in IMAGE_SUFFIXES:
+            try:
+                from PIL import Image, ImageOps  # type: ignore
+
+                with Image.open(src) as img:
+                    n_frames = int(getattr(img, "n_frames", 1) or 1)
+                    if not 1 <= page <= n_frames:
+                        raise HTTPException(404, "帧序号超出图片范围")
+                    if suffix == ".png" and n_frames == 1:
+                        return StreamingResponse(io.BytesIO(src.read_bytes()), media_type="image/png")
+                    img.seek(page - 1)
+                    frame = ImageOps.exif_transpose(img).convert("RGB")
+                    buf = io.BytesIO()
+                    frame.save(buf, format="PNG")
+                    return StreamingResponse(io.BytesIO(buf.getvalue()), media_type="image/png")
+            except HTTPException:
+                raise
+            except Exception as err:
+                raise HTTPException(500, f"渲染图片失败: {err}") from None
+        raise HTTPException(404, "仅本地已上传的 PDF 或图片文件支持图像预览")
 
     @api.get("/api/projects/{project_id}/source/{doc_id}")
     def download_source(project_id: str, doc_id: str):
@@ -1288,15 +1289,13 @@ def create_web_app(runtime_root: Path | None = None) -> FastAPI:
             chunk_cnt, vec_cnt = conn.execute(
                 "SELECT COUNT(*), COUNT(c.embedding) FROM chunks c JOIN documents d ON d.id=c.doc_id WHERE d.indexed=1"
             ).fetchone()
+        from local_ocr import is_ocr_available
+
         emb = embedding_health()
         llm = llm_config_status()
-        binary = ("Scripts", "python.exe") if os.name == "nt" else ("bin", "python")
-        ocr_python = ocr_root().joinpath(".venv", *binary)
-        app_service = os.environ.get("RFQ_APP_SERVICE", "").casefold() in {"1", "true"}
-        interpreter_available = ocr_python.is_file() or (app_service and Path(sys.executable).is_file())
         ocr_status = "已关闭"
         if cfg.get("ocr_enabled"):
-            ocr_status = "已启用（按页识别）" if interpreter_available else "本地 OCR 未安装"
+            ocr_status = "已启用（本地离线 RapidOCR 就绪）" if is_ocr_available() else "本地 OCR 未安装"
         last_call_note = ""
         if cfg.get("online_answers_enabled") is True and llm.get("configured"):
             with store._conn() as conn:

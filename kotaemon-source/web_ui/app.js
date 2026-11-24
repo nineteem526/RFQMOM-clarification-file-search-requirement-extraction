@@ -18,6 +18,14 @@ const state = {
   previewChunks: [],
   previewChunkIdx: 0,
   previewDocId: null,
+  previewCanImage: false,
+  previewShowImage: false,
+  detailDoc: null,
+  detailChunks: [],
+  detailChunkIdx: 0,
+  detailCanImage: false,
+  detailShowImage: false,
+  detailSummary: null,
   savedKind: "all",
   savedKeyword: "",
   savedItems: [],
@@ -342,10 +350,46 @@ function renderFolderChips() {
   });
 }
 
+function _docSupportsImage(doc) {
+  if (!doc || !doc.file_path) return false;
+  const ft = String(doc.file_type || "").toUpperCase();
+  return ["PDF", "PNG", "JPG", "JPEG", "BMP", "WEBP", "TIF", "TIFF"].includes(ft);
+}
+
+function _pageImageUrl(docId, page) {
+  return `/api/projects/${encodeURIComponent(state.projectId)}/documents/${encodeURIComponent(docId)}/page-image/${Math.max(1, Number(page || 1))}`;
+}
+
+function _statusBadgeHtml(status) {
+  const s = String(status || "");
+  if (s === "已索引") return `<span class="status-badge ok">${esc(s)}</span>`;
+  if (s.includes("部分") || s.includes("待")) return `<span class="status-badge warn">${esc(s)}</span>`;
+  if (s.includes("失败")) return `<span class="status-badge err">${esc(s)}</span>`;
+  return `<span class="status-badge">${esc(s)}</span>`;
+}
+
+function _chunkTypeLabel(chunkType) {
+  if (chunkType === "table") return { cls: "table", label: "表格切片" };
+  if (chunkType === "ocr") return { cls: "ocr", label: "OCR 识别" };
+  return { cls: "text", label: "正文切片" };
+}
+
 function renderDocsTable() {
   const folder = state.selectedFolder;
   const term = state.docsSearch.trim().toLowerCase();
   const allDocs = state.docsData.documents || [];
+
+  const pendingCount = allDocs.filter((d) => d.status === "待重新解析" || d.status === "解析失败").length;
+  const pendingBtn = $("#btn-reparse-pending");
+  const pendingBanner = $("#docs-pending-banner");
+  if (pendingBtn) pendingBtn.classList.toggle("hidden", pendingCount === 0);
+  if (pendingBanner) {
+    pendingBanner.classList.toggle("hidden", pendingCount === 0);
+    if (pendingCount > 0) {
+      $("#docs-pending-text").textContent = `当前项目有 ${pendingCount} 份文档待重新解析或索引失败，点击右侧按钮可按 PDF/表格/OCR 规则批量切片恢复。`;
+    }
+  }
+
   let filtered = folder ? allDocs.filter((d) => d.folder === folder) : allDocs;
   if (term) {
     filtered = filtered.filter((d) => d.name.toLowerCase().includes(term));
@@ -355,7 +399,7 @@ function renderDocsTable() {
 
   const tbody = $("#docs-table-body");
   if (!filtered.length) {
-    tbody.innerHTML = `<tr><td colspan="5"><div class="empty-state-box">当前条件下暂无文件，可点击右上角“上传资料”导入工程文档。</div></td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="6"><div class="empty-state-box">当前条件下暂无文件，可点击右上角“上传资料”导入工程文档。</div></td></tr>`;
     return;
   }
   tbody.innerHTML = filtered
@@ -369,9 +413,10 @@ function renderDocsTable() {
           </div>
         </td>
         <td>${esc(d.file_type)}</td>
+        <td>${Number(d.chunk_count || 0) > 0 ? esc(d.chunk_count) + " 块" : "0 块"}</td>
         <td>${esc(d.version)}</td>
         <td>${esc(d.updated_at)}</td>
-        <td>${esc(d.status)}</td>
+        <td>${_statusBadgeHtml(d.status)}</td>
       </tr>
     `
     )
@@ -390,30 +435,91 @@ async function loadDocDetail(docId) {
   try {
     const data = await api(`/api/projects/${encodeURIComponent(state.projectId)}/documents/${encodeURIComponent(docId)}/preview`);
     const doc = data.document;
+    const summary = data.chunk_summary || { total: (data.chunks || []).length, text: 0, table: 0, ocr: 0 };
+    state.detailDoc = doc;
+    state.detailChunks = data.chunks || [];
+    state.detailChunkIdx = 0;
+    state.detailCanImage = Boolean(data.can_preview_image);
+    state.detailShowImage = false;
+    state.detailSummary = summary;
+
     $("#detail-doc-name").textContent = doc.name;
     $("#detail-open-source").href = `/api/projects/${encodeURIComponent(state.projectId)}/source/${encodeURIComponent(doc.id)}`;
+    const breakdown = summary.total > 0
+      ? `${summary.total} 块（正文 ${summary.text} · 表格 ${summary.table} · OCR ${summary.ocr}）`
+      : "0 块（需重新解析或无文本）";
     $("#detail-kv-grid").innerHTML = `
       <div class="kv-row"><dt>版本</dt><dd>${esc(doc.version)}</dd></div>
       <div class="kv-row"><dt>页数</dt><dd>${doc.pages > 0 ? esc(doc.pages) + " 页" : "—"}</dd></div>
+      <div class="kv-row"><dt>切块统计</dt><dd>${esc(breakdown)}</dd></div>
       <div class="kv-row"><dt>更新时间</dt><dd>${esc(doc.updated_at)}</dd></div>
-      <div class="kv-row"><dt>解析状态</dt><dd>${esc(doc.status)}</dd></div>
+      <div class="kv-row"><dt>解析状态</dt><dd>${_statusBadgeHtml(doc.status)}</dd></div>
       <div class="kv-row"><dt>所属目录</dt><dd>${esc(doc.folder)}</dd></div>
       <div class="kv-row"><dt>文件大小</dt><dd>${formatSize(doc.size_bytes)}</dd></div>
     `;
-    const chunk = data.active_chunk;
-    const warnings = (doc.parse_warnings || []).map((message) => "<li>" + esc(message) + "</li>").join("");
-    $("#detail-preview-body").innerHTML =
-      (warnings ? '<ul class="basis-list">' + warnings + "</ul>" : "") +
-      (chunk ? highlightText(chunk.content, chunk.highlight, "hl-yellow") : '<div class="empty-state-box">暂无可预览文本内容</div>');
+    renderDocDetailPreview();
   } catch {
     renderEmptyDocDetail();
   }
 }
 
+function renderDocDetailPreview() {
+  const doc = state.detailDoc;
+  const chunks = state.detailChunks || [];
+  const total = chunks.length;
+  const idx = Math.min(Math.max(0, state.detailChunkIdx), Math.max(0, total - 1));
+  state.detailChunkIdx = idx;
+
+  $("#detail-chunk-indicator").textContent = total > 0 ? `${idx + 1} / ${total}` : "0 / 0";
+  const imgBtn = $("#detail-toggle-page-img");
+  if (imgBtn) {
+    imgBtn.classList.toggle("hidden", !state.detailCanImage);
+    imgBtn.textContent = state.detailShowImage ? "切回文本块" : "原页图像";
+  }
+
+  const chunk = chunks[idx] || null;
+  const metaEl = $("#detail-chunk-meta");
+  if (metaEl) {
+    if (chunk) {
+      const tp = _chunkTypeLabel(chunk.chunk_type);
+      const sec = String(chunk.section || "正文");
+      const hasPagePrefix = /^第\s*\d+\s*页/.test(sec);
+      const isPdf = String((doc && doc.file_type) || "").toUpperCase() === "PDF";
+      const locLabel = (!isPdf || hasPagePrefix) ? sec : `第 ${chunk.page || 1} 页 · ${sec}`;
+      metaEl.classList.remove("hidden");
+      metaEl.innerHTML = `<span class="chunk-type-pill ${tp.cls}">${tp.label}</span><span class="chunk-sec-tag">${esc(locLabel)}</span>`;
+    } else {
+      metaEl.classList.add("hidden");
+      metaEl.innerHTML = "";
+    }
+  }
+
+  const warnings = ((doc && doc.parse_warnings) || []).map((m) => "<li>" + esc(m) + "</li>").join("");
+  const warnHtml = warnings ? '<ul class="basis-list" style="margin-bottom:10px;">' + warnings + "</ul>" : "";
+  if (state.detailShowImage && state.detailCanImage && doc) {
+    const pageNo = chunk ? chunk.page || 1 : 1;
+    $("#detail-preview-body").innerHTML = `${warnHtml}<div class="page-img-wrap"><img class="page-preview-img" src="${_pageImageUrl(doc.id, pageNo)}" alt="原页图像" /></div>`;
+    return;
+  }
+  $("#detail-preview-body").innerHTML =
+    warnHtml +
+    (chunk
+      ? highlightText(chunk.content, chunk.highlight, "hl-yellow")
+      : '<div class="empty-state-box">暂无可预览切块内容，请点击上方“重新解析”提取文本或开启 OCR。</div>');
+}
+
 function renderEmptyDocDetail() {
+  state.detailDoc = null;
+  state.detailChunks = [];
+  state.detailChunkIdx = 0;
+  state.detailCanImage = false;
+  state.detailShowImage = false;
   $("#detail-doc-name").textContent = "未选择文件";
   $("#detail-open-source").href = "#";
   $("#detail-kv-grid").innerHTML = "";
+  $("#detail-chunk-indicator").textContent = "- / -";
+  if ($("#detail-toggle-page-img")) $("#detail-toggle-page-img").classList.add("hidden");
+  if ($("#detail-chunk-meta")) $("#detail-chunk-meta").classList.add("hidden");
   $("#detail-preview-body").innerHTML = '<div class="empty-state-box">点击左侧列表中的文件查看详情与内容预览。</div>';
 }
 
@@ -595,10 +701,15 @@ function setQaCitations(citations, activeIdx = 0) {
     state.previewDocId = c.doc_id;
     state.previewChunks = [c];
     state.previewChunkIdx = 0;
+    state.previewShowImage = false;
+    const matchedDoc = (state.docsData.documents || []).find((d) => d.id === c.doc_id);
+    state.previewCanImage = _docSupportsImage(matchedDoc);
     renderQaPreviewCard(c.file_name, c.location || c.section, c.page, c.total_pages, c.content, c.highlight, c.doc_id);
   } else {
     state.previewChunks = [];
     state.previewDocId = null;
+    state.previewCanImage = false;
+    state.previewShowImage = false;
     renderEmptyQaPreview();
   }
 }
@@ -632,6 +743,8 @@ async function openDocInQaPreview(docId) {
   state.previewDocId = docId;
   state.previewChunks = data.chunks || [];
   state.previewChunkIdx = 0;
+  state.previewCanImage = Boolean(data.can_preview_image);
+  state.previewShowImage = false;
   const doc = data.document;
   const ch = state.previewChunks[0];
   if (ch) {
@@ -644,12 +757,26 @@ async function openDocInQaPreview(docId) {
 function renderQaPreviewCard(name, loc, page, totalPages, content, highlight, docId) {
   $("#qa-preview-name").textContent = name;
   $("#qa-preview-loc").textContent = loc;
-  $("#qa-page-indicator").textContent = totalPages > 0 ? `${page} / ${totalPages}` : "—";
-  $("#qa-preview-body").innerHTML = highlightText(content, highlight, "hl-yellow");
+  $("#qa-page-indicator").textContent = totalPages > 0
+    ? `${page} / ${totalPages}`
+    : (state.previewChunks.length > 1 ? `${state.previewChunkIdx + 1} / ${state.previewChunks.length}` : "—");
+  const imgBtn = $("#qa-toggle-page-img");
+  if (imgBtn) {
+    imgBtn.classList.toggle("hidden", !state.previewCanImage);
+    imgBtn.textContent = state.previewShowImage ? "切回文本" : "原页图像";
+  }
+  if (state.previewShowImage && state.previewCanImage && docId) {
+    $("#qa-preview-body").innerHTML = `<div class="page-img-wrap"><img class="page-preview-img" src="${_pageImageUrl(docId, page)}" alt="原页图像" /></div>`;
+  } else {
+    $("#qa-preview-body").innerHTML = highlightText(content, highlight, "hl-yellow");
+  }
   $("#qa-open-full-file").href = `/api/projects/${encodeURIComponent(state.projectId)}/source/${encodeURIComponent(docId)}`;
 }
 
 function renderEmptyQaPreview() {
+  state.previewCanImage = false;
+  state.previewShowImage = false;
+  if ($("#qa-toggle-page-img")) $("#qa-toggle-page-img").classList.add("hidden");
   $("#qa-preview-name").textContent = "暂无原文预览";
   $("#qa-preview-loc").textContent = "提出问题或切换“项目资料”点选文件查看原文";
   $("#qa-page-indicator").textContent = "- / -";
@@ -1020,19 +1147,37 @@ function bindEvents() {
     renderChatFeed();
     showToast("已清空当前对话");
   });
+  const renderQaPreviewAtIdx = () => {
+    const ch = state.previewChunks[state.previewChunkIdx];
+    const doc = state.docsData.documents.find((d) => d.id === state.previewDocId);
+    if (ch) {
+      renderQaPreviewCard(
+        doc ? doc.name : (ch.file_name || ""),
+        ch.section || ch.location,
+        ch.page,
+        doc?.pages ?? ch.total_pages,
+        ch.content,
+        ch.highlight,
+        state.previewDocId
+      );
+    } else if (doc) {
+      renderQaPreviewCard(doc.name, "原页预览", 1, doc.pages, "", "", doc.id);
+    }
+  };
   $("#qa-prev-page").addEventListener("click", () => {
     if (state.previewChunks.length <= 1) return;
     state.previewChunkIdx = Math.max(0, state.previewChunkIdx - 1);
-    const ch = state.previewChunks[state.previewChunkIdx];
-    const doc = state.docsData.documents.find((d) => d.id === state.previewDocId);
-    renderQaPreviewCard(doc ? doc.name : "", ch.section, ch.page, doc?.pages, ch.content, ch.highlight, state.previewDocId);
+    renderQaPreviewAtIdx();
   });
   $("#qa-next-page").addEventListener("click", () => {
     if (state.previewChunks.length <= 1) return;
     state.previewChunkIdx = Math.min(state.previewChunks.length - 1, state.previewChunkIdx + 1);
-    const ch = state.previewChunks[state.previewChunkIdx];
-    const doc = state.docsData.documents.find((d) => d.id === state.previewDocId);
-    renderQaPreviewCard(doc ? doc.name : "", ch.section, ch.page, doc?.pages, ch.content, ch.highlight, state.previewDocId);
+    renderQaPreviewAtIdx();
+  });
+  $("#qa-toggle-page-img").addEventListener("click", () => {
+    if (!state.previewCanImage || !state.previewDocId) return;
+    state.previewShowImage = !state.previewShowImage;
+    renderQaPreviewAtIdx();
   });
 
   // Docs interactions
@@ -1091,9 +1236,58 @@ function bindEvents() {
   });
   $("#btn-reparse-doc").addEventListener("click", async () => {
     if (!state.selectedDocId) return;
-    await api(`/api/projects/${encodeURIComponent(state.projectId)}/documents/${encodeURIComponent(state.selectedDocId)}/reparse`, { method: "POST" });
-    await loadDocuments();
-    showToast("已完成重新解析与索引更新");
+    const btn = $("#btn-reparse-doc");
+    btn.disabled = true;
+    btn.textContent = "解析中…";
+    try {
+      const res = await api(`/api/projects/${encodeURIComponent(state.projectId)}/documents/${encodeURIComponent(state.selectedDocId)}/reparse`, { method: "POST" });
+      await loadDocuments();
+      showToast(`重新解析完成：共 ${res.total_chunks || 0} 个切块`);
+    } catch (err) {
+      showToast(err.message);
+    } finally {
+      btn.disabled = false;
+      btn.textContent = "重新解析";
+    }
+  });
+
+  const runBatchReparse = async (onlyPending, triggerBtn) => {
+    const origText = triggerBtn.textContent;
+    triggerBtn.disabled = true;
+    triggerBtn.textContent = "批量解析中…";
+    try {
+      const res = await api(`/api/projects/${encodeURIComponent(state.projectId)}/documents/reparse-all`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ only_pending: onlyPending }),
+      });
+      await loadDocuments();
+      showToast(`已处理 ${res.processed} 份文档：成功 ${res.indexed}，需核对 ${res.partial}，失败 ${res.failed}`);
+    } catch (err) {
+      showToast(err.message);
+    } finally {
+      triggerBtn.disabled = false;
+      triggerBtn.textContent = origText;
+    }
+  };
+  $("#btn-reparse-pending").addEventListener("click", (e) => runBatchReparse(true, e.currentTarget));
+  $("#btn-banner-reparse-pending").addEventListener("click", (e) => runBatchReparse(true, e.currentTarget));
+  $("#btn-reparse-all").addEventListener("click", (e) => runBatchReparse(false, e.currentTarget));
+
+  $("#detail-prev-chunk").addEventListener("click", () => {
+    if (state.detailChunks.length <= 1) return;
+    state.detailChunkIdx = Math.max(0, state.detailChunkIdx - 1);
+    renderDocDetailPreview();
+  });
+  $("#detail-next-chunk").addEventListener("click", () => {
+    if (state.detailChunks.length <= 1) return;
+    state.detailChunkIdx = Math.min(state.detailChunks.length - 1, state.detailChunkIdx + 1);
+    renderDocDetailPreview();
+  });
+  $("#detail-toggle-page-img").addEventListener("click", () => {
+    if (!state.detailCanImage) return;
+    state.detailShowImage = !state.detailShowImage;
+    renderDocDetailPreview();
   });
 
   // Saved interactions (preserved)
