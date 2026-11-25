@@ -665,14 +665,43 @@ _PENDING_RE = re.compile(r"待(?:业主)?批准|待确认|尚未批准|拟采用
 _APPROVED_RE = re.compile(r"(?<!尚未)(?<!未)(?:已批准|已确认|已生效)|(?<!not )\b(?:approved|confirmed|in effect)\b", re.I)
 _MODEL_RE = re.compile(r"(?<![a-z0-9])(?=[a-z0-9._/-]*[a-z])(?=[a-z0-9._/-]*\d)[a-z0-9]+(?:[._/-][a-z0-9]+)*(?![a-z0-9])", re.I)
 _NUMBER_RE = re.compile(r"(?<!\d)[+\-−]?\d+(?:[.,]\d+)*(?!\d)")
+_UNIT_ALT = (
+    r"(?:kN/m[²2]|N[·⋅ ]?m|mm[²2]?|cm[²2]?|m/s|m[²2]?|kV|mV|V(?:\s*(?:AC|DC))?|mA|A|kW|W|kg|mg|g|lbs?|"
+    r"rpm|/min|μm|µm|dB|[kMG]?Hz|°[CF]|℃|℉|%|MPa|kPa|Pa|ms|s|km/h|Mbps)"
+)
 _MEASUREMENT_RE = re.compile(
-    r"(?<![a-z0-9])([+\-−]?\d+(?:[.,]\d+)*)\s*"
-    r"(kN/m[²2]|N[·⋅ ]?m|mm[²2]?|cm[²2]?|m/s|m[²2]?|kV|mV|V(?:\s*(?:AC|DC))?|mA|A|kW|W|kg|mg|g|lbs?|"
-    r"rpm|/min|μm|µm|dB|[kMG]?Hz|°[CF]|℃|℉|%|MPa|kPa|Pa|ms|s|km/h|Mbps)(?![a-z0-9])",
+    rf"(?<![a-z0-9])([+\-−]?\d+(?:[.,]\d+)*)\s*({_UNIT_ALT})(?![a-z0-9])",
     re.I,
 )
+_SPLIT_VALUE_UNIT_RE = re.compile(
+    rf"(?:数值|参数值|额定值|设定值|value)\s*[:：=]?\s*([+\-−]?\d+(?:[.,]\d+)*)\s*"
+    rf"[;|；，,\n\t]+\s*(?:单位|units?)\s*[:：=]?\s*({_UNIT_ALT})(?![a-z0-9])",
+    re.I,
+)
+_SPLIT_UNIT_VALUE_RE = re.compile(
+    rf"(?:单位|units?)\s*[:：=]?\s*({_UNIT_ALT})\s*"
+    rf"[;|；，,\n\t]+\s*(?:数值|参数值|额定值|设定值|value)\s*[:：=]?\s*([+\-−]?\d+(?:[.,]\d+)*)(?![a-z0-9])",
+    re.I,
+)
+_ABSENCE_CLAUSE_RE = re.compile(
+    r"(?:未提及|未说明|未给出|未规定|未列明|不包含|并未给出|并未说明|并未提及|无明确规定|无相关规定|"
+    r"没有[^，。；]{0,16}(?:指令|规定|说明|提及|记载|记录)|证据不足|"
+    r"not\s+mentioned|not\s+specified|does\s+not\s+(?:mention|specify|provide|state)|"
+    r"no\s+(?:specific\s+)?(?:guideline|instruction|information|mention|requirement|record))",
+    re.I,
+)
+_SUBCLAUSE_SPLIT_RE = re.compile(r"(?:[;；，\n]|(?<!\d),(?!\d)|(?:但|而是|实际为|实为|改为)|\b(?:but|however)\b)+", re.I)
 _LIST_PREFIX_RE = re.compile(r"^\s*(?:\d+[.)、]|[（(]\d+[)）])\s*")
 _PAGE_REF_RE = re.compile(r"(?:第\s*\d+\s*页|\bpages?\s*\d+\b|\bp\.\s*\d+\b)", re.I)
+
+
+def _normalize_fact_text(text: str) -> str:
+    norm = text.casefold().replace("−", "-").replace("µ", "μ").replace("℃", "°c").replace("℉", "°f")
+    # Normalize D.C. 18 V / DC 18V / 18 V DC -> 18 vdc
+    norm = re.sub(r"\b([ad])\.c\.?", r"\1c", norm)
+    norm = re.sub(r"\b(ac|dc)\s*(\d+(?:\.\d+)?)\s*v\b", r"\2 v\1", norm)
+    norm = re.sub(r"(?<=\d),(?=\d{3}(?:\D|$))", "", norm)
+    return norm
 
 
 def _normalize_number_str(num: str) -> str:
@@ -694,12 +723,19 @@ def _normalize_unit_str(unit: str) -> str:
     return u
 
 
+def _extract_split_evidence_measurements(evidence_text: str) -> set[tuple[str, str]]:
+    """Pair separated Value + Unit columns from structured tables into valid evidence measurements."""
+    norm = _normalize_fact_text(evidence_text)
+    pairs: set[tuple[str, str]] = set()
+    for n, u in _SPLIT_VALUE_UNIT_RE.findall(norm):
+        pairs.add((_normalize_number_str(n), _normalize_unit_str(u)))
+    for u, n in _SPLIT_UNIT_VALUE_RE.findall(norm):
+        pairs.add((_normalize_number_str(n), _normalize_unit_str(u)))
+    return pairs
+
+
 def _claim_facts(text: str):
-    text = text.casefold().replace("−", "-").replace("µ", "μ").replace("℃", "°c").replace("℉", "°f")
-    # Normalize D.C. 18 V / DC 18V / 18 V DC -> 18 vdc
-    text = re.sub(r"\b([ad])\.c\.?", r"\1c", text)
-    text = re.sub(r"\b(ac|dc)\s*(\d+(?:\.\d+)?)\s*v\b", r"\2 v\1", text)
-    text = re.sub(r"(?<=\d),(?=\d{3}(?:\D|$))", "", text)
+    text = _normalize_fact_text(text)
     # Strip benign list item prefixes (e.g., "1. ...") and explicit page pointers ("第 2 页")
     text = _LIST_PREFIX_RE.sub("", text)
     text = _PAGE_REF_RE.sub(" ", text)
@@ -725,27 +761,42 @@ def _measurement_supported(claim_m: tuple[str, str], ev_measurements: set[tuple[
     return False
 
 
-def _facts_missing(claim_text: str, evidence_text: str) -> list[str]:
+def _facts_missing(
+    claim_text: str,
+    evidence_text: str,
+    allowed_question_facts: tuple[set[str], set[str], set[tuple[str, str]]] | None = None,
+) -> list[str]:
     c_nums, c_models, c_meas = _claim_facts(claim_text)
     e_nums, e_models, e_meas = _claim_facts(evidence_text)
+    e_meas = e_meas | _extract_split_evidence_measurements(evidence_text)
     ev_meas_nums = {n for n, _ in e_meas}
     all_ev_nums = e_nums | ev_meas_nums
 
+    q_nums, q_models, q_meas = allowed_question_facts or (set(), set(), set())
+    q_all_nums = q_nums | {n for n, _ in q_meas}
+
     missing: list[str] = []
     for m in sorted(c_meas):
-        if not _measurement_supported(m, e_meas, all_ev_nums):
+        if not _measurement_supported(m, e_meas, all_ev_nums) and not (
+            q_meas and _measurement_supported(m, q_meas, q_all_nums)
+        ):
             missing.append(f"{m[0]}{m[1]}")
     for mod in sorted(c_models):
-        if mod not in e_models and mod not in evidence_text.casefold():
+        if mod not in e_models and mod not in evidence_text.casefold() and mod not in q_models:
             missing.append(mod)
     for num in sorted(c_nums):
-        if num not in all_ev_nums:
+        if num not in all_ev_nums and num not in q_all_nums:
             missing.append(num)
     return missing
 
 
-def verify_grounded_answer(answer_payload: dict[str, Any], citations: list[dict[str, Any]]) -> dict[str, Any]:
+def verify_grounded_answer(
+    answer_payload: dict[str, Any],
+    citations: list[dict[str, Any]],
+    question: str = "",
+) -> dict[str, Any]:
     """Check each answer field against the evidence it cites, with precise diagnostics."""
+    q_facts = _claim_facts(question) if question and question.strip() else None
     by_index = {
         c["index"]: "\n".join(filter(None, (c.get("file_name", ""), c.get("location", ""), c.get("content", ""))))
         for c in citations
@@ -823,9 +874,14 @@ def verify_grounded_answer(answer_payload: dict[str, Any], citations: list[dict[
         raw_sources = [raw_content_by_index[index] for index in valid_refs]
         raw_evidence = "\n".join(raw_sources)
 
-        missing = _facts_missing(_CITATION_RE.sub("", claim), evidence)
+        plain_claim = _CITATION_RE.sub("", claim)
+        subclauses = [s.strip() for s in _SUBCLAUSE_SPLIT_RE.split(plain_claim) if s.strip()] or [plain_claim]
+        missing: list[str] = []
+        for sub in subclauses:
+            allowed_q = q_facts if (q_facts is not None and _ABSENCE_CLAUSE_RE.search(sub)) else None
+            missing.extend(_facts_missing(sub, evidence, allowed_question_facts=allowed_q))
         if missing:
-            warnings.append(f"数字、单位或型号缺少引文支持：{', '.join(missing[:4])}")
+            warnings.append(f"数字、单位或型号缺少引文支持：{', '.join(list(dict.fromkeys(missing))[:4])}")
         if _PENDING_RE.search(raw_evidence) and not _PENDING_RE.search(claim):
             warnings.append("引用含待批准/建议条款，回答缺少对应审批状态限定")
         if _APPROVED_RE.search(claim) and not any(
@@ -1222,7 +1278,7 @@ def generate_structured_answer(
                 "table": llm_out.get("table", []),
                 "citations": citations,
             }
-            ver = verify_grounded_answer(payload, citations)
+            ver = verify_grounded_answer(payload, citations, question=question)
             if ver["passed"]:
                 for item in payload["basis"]:
                     refs = {int(n) for n in _CITATION_RE.findall(item["detail"])}

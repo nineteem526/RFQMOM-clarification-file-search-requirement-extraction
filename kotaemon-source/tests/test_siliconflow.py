@@ -241,6 +241,86 @@ class SiliconFlowTests(unittest.TestCase):
         self.assertEqual(ans["table"], [])
         self.assertTrue(ans["citations"])
 
+    def test_verifier_accepts_split_table_value_unit_and_rejects_mismatch(self):
+        citations = [
+            {
+                "index": 1,
+                "file_name": "虚构电气表.xlsx",
+                "location": "虚构电气表.xlsx 第3行",
+                "content": "对象：PLC控制电源；型号：PLC-S7-1500；参数：电压；数值：24；单位：V DC；条件：控制回路；批准状态：已确认",
+            },
+            {
+                "index": 2,
+                "file_name": "spec.xlsx",
+                "location": "工作表 参数",
+                "content": "Item: Overall length | Value: 172 | Unit: mm",
+            },
+        ]
+        self.assertTrue(
+            rag_engine.verify_grounded_answer(
+                {"conclusion": "PLC-S7-1500 控制电源电压为 24 V DC [1]，总长度为 172 mm [2]。"},
+                citations,
+            )["passed"]
+        )
+        # Wrong unit or wrong value must still be rejected strictly
+        self.assertFalse(
+            rag_engine.verify_grounded_answer(
+                {"conclusion": "PLC-S7-1500 控制电源电压为 24 V AC [1]。"},
+                citations,
+            )["passed"]
+        )
+        self.assertFalse(
+            rag_engine.verify_grounded_answer(
+                {"conclusion": "PLC-S7-1500 控制电源电压为 48 V DC [1]。"},
+                citations,
+            )["passed"]
+        )
+
+    def test_verifier_allows_question_numbers_only_in_explicit_absence_refusal(self):
+        citations = [
+            {
+                "index": 1,
+                "file_name": "manual.pdf",
+                "location": "Page 4",
+                "content": "Charge the battery cartridge at room temperature (10 °C - 40 °C).",
+            },
+            {
+                "index": 2,
+                "file_name": "spec.txt",
+                "location": "Section 1",
+                "content": "Control cabinet enclosure protection rating: IP54.",
+            },
+        ]
+        self.assertTrue(
+            rag_engine.verify_grounded_answer(
+                {"conclusion": "文档未提及 0 °C (32 °F) 以下操作准则，仅说明充电温度为 10 °C - 40 °C [1]。"},
+                citations,
+                question="Are there specific safety guidelines below 0 °C (32 °F)?",
+            )["passed"]
+        )
+        # Affirmative sub-clauses cannot smuggle numbers/models from the question
+        self.assertFalse(
+            rag_engine.verify_grounded_answer(
+                {"conclusion": "原文未规定 IP65，实际防护等级为 IP68 [2]。"},
+                citations,
+                question="Is cabinet IP65 or IP68?",
+            )["passed"]
+        )
+        self.assertFalse(
+            rag_engine.verify_grounded_answer(
+                {"conclusion": "原文未规定 IP65 但实为 IP68 [2]。"},
+                citations,
+                question="Is cabinet IP65 or IP68?",
+            )["passed"]
+        )
+        self.assertFalse(
+            rag_engine.verify_grounded_answer(
+                {"conclusion": "电控柜防护等级为 IP65 [2]。"},
+                citations,
+                question="Is cabinet IP65 or IP68?",
+            )["passed"]
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
