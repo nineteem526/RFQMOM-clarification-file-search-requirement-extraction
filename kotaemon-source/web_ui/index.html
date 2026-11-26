@@ -44,9 +44,28 @@
         <div class="split-layout" id="qa-split">
           <!-- Left: 主问答区 -->
           <section class="col-center qa-center split-left">
-            <div class="center-header">
-              <h2>项目问答</h2>
-              <button class="btn-ghost-sm" id="btn-clear-chat" type="button" title="开始新的空白对话">清空对话</button>
+            <div class="center-header qa-header-bar">
+              <div class="qa-header-left">
+                <h2>项目问答</h2>
+                <span class="active-session-pill" id="qa-active-session-title" title="当前对话主题">新对话</span>
+              </div>
+              <div class="qa-header-actions">
+                <div class="history-menu-wrap" id="chat-history-wrap">
+                  <button class="btn-secondary btn-sm history-trigger" id="btn-toggle-history" type="button" aria-haspopup="true" aria-expanded="false">
+                    <span>历史对话</span>
+                    <span class="history-count-badge" id="chat-history-count">0</span>
+                    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m6 9 6 6 6-6"/></svg>
+                  </button>
+                  <div class="history-popover hidden" id="chat-history-popover">
+                    <div class="history-popover-head">
+                      <span class="history-popover-title">当前项目历史对话</span>
+                      <input type="text" id="chat-history-search" class="history-search-input" placeholder="搜索对话标题或问题…" autocomplete="off" />
+                    </div>
+                    <div class="history-popover-list" id="chat-history-list"></div>
+                  </div>
+                </div>
+                <button class="btn-primary btn-sm" id="btn-new-chat" type="button" title="保留当前对话并开启空白新对话">+ 新建对话</button>
+              </div>
             </div>
             <div class="chat-feed" id="chat-feed"></div>
             <div class="chat-composer-wrap">

@@ -12,6 +12,9 @@ const state = {
   foldersInitializedForProject: null,
   qaSearch: "",
   docsSearch: "",
+  historySearch: "",
+  chatSessions: [],
+  activeSessionId: null,
   chatMessages: [],
   activeCitations: [],
   activeCitationIndex: 0,
@@ -187,6 +190,11 @@ function renderProjectSwitcher() {
         state.selectedDocId = null;
         state.foldersInitializedForProject = null;
         state.selectedSavedId = null;
+        state.activeSessionId = null;
+        state.chatSessions = [];
+        state.historySearch = "";
+        if ($("#chat-history-popover")) $("#chat-history-popover").classList.add("hidden");
+        if ($("#chat-history-search")) $("#chat-history-search").value = "";
         renderProjectSwitcher();
         await reloadProjectContext();
         const proj = state.projects.find((x) => x.id === pid);
@@ -538,9 +546,147 @@ function setQaRightTab(tab) {
   $("#qa-panel-docs").classList.toggle("hidden", tab !== "docs");
 }
 
-async function loadChatHistory() {
-  const data = await api(`/api/projects/${encodeURIComponent(state.projectId)}/chat/history`);
+function renderChatSessionHeader() {
+  const cntEl = $("#chat-history-count");
+  const titleEl = $("#qa-active-session-title");
+  if (cntEl) cntEl.textContent = String((state.chatSessions || []).length);
+  if (titleEl) {
+    const active = (state.chatSessions || []).find((s) => s.id === state.activeSessionId);
+    titleEl.textContent = active ? active.title : "新对话";
+  }
+}
+
+function renderHistoryList() {
+  const listEl = $("#chat-history-list");
+  if (!listEl) return;
+  const term = (state.historySearch || "").trim().toLowerCase();
+  const sessions = (state.chatSessions || []).filter((s) => {
+    if (!term) return true;
+    return (
+      String(s.title || "").toLowerCase().includes(term) ||
+      String(s.last_question || "").toLowerCase().includes(term)
+    );
+  });
+  if (!sessions.length) {
+    listEl.innerHTML = '<div class="empty-state-box" style="padding:16px 10px;">暂无历史对话记录</div>';
+    return;
+  }
+  listEl.innerHTML = sessions
+    .map(
+      (s) => `
+      <div class="history-item ${s.id === state.activeSessionId ? "active" : ""}" data-sid="${esc(s.id)}">
+        <div class="history-item-main">
+          <div class="history-item-title" title="${esc(s.title)}">${esc(s.title)}</div>
+          <div class="history-item-meta">${esc(s.updated_at || s.created_at || "")} · ${Number(s.message_count || 0)} 轮</div>
+        </div>
+        <div class="history-item-actions">
+          <button class="history-icon-btn rename" data-sid="${esc(s.id)}" type="button" title="重命名">✎</button>
+          <button class="history-icon-btn del" data-sid="${esc(s.id)}" type="button" title="删除对话">×</button>
+        </div>
+      </div>
+    `
+    )
+    .join("");
+
+  listEl.querySelectorAll(".history-item").forEach((row) => {
+    row.addEventListener("click", async () => {
+      const sid = row.dataset.sid;
+      $("#chat-history-popover").classList.add("hidden");
+      $("#btn-toggle-history").setAttribute("aria-expanded", "false");
+      await loadChatHistory(sid);
+    });
+  });
+
+  listEl.querySelectorAll(".history-icon-btn.rename").forEach((btn) => {
+    btn.addEventListener("click", async (e) => {
+      e.stopPropagation();
+      const sid = btn.dataset.sid;
+      const cur = (state.chatSessions || []).find((s) => s.id === sid);
+      const next = window.prompt("修改对话标题：", cur ? cur.title : "");
+      if (next === null) return;
+      const trimmed = next.trim();
+      if (!trimmed) return showToast("对话标题不能为空");
+      try {
+        const res = await api(`/api/projects/${encodeURIComponent(state.projectId)}/chat/sessions/${encodeURIComponent(sid)}`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ title: trimmed }),
+        });
+        state.chatSessions = state.chatSessions.map((s) => (s.id === sid ? res.session : s));
+        renderChatSessionHeader();
+        renderHistoryList();
+        showToast("已更新对话标题");
+      } catch (err) {
+        showToast(err.message);
+      }
+    });
+  });
+
+  listEl.querySelectorAll(".history-icon-btn.del").forEach((btn) => {
+    btn.addEventListener("click", async (e) => {
+      e.stopPropagation();
+      const sid = btn.dataset.sid;
+      try {
+        await api(`/api/projects/${encodeURIComponent(state.projectId)}/chat/sessions/${encodeURIComponent(sid)}`, {
+          method: "DELETE",
+        });
+        const deletedActive = state.activeSessionId === sid;
+        if (deletedActive) {
+          state.activeSessionId = null;
+          await loadChatHistory(null);
+        } else {
+          const res = await api(`/api/projects/${encodeURIComponent(state.projectId)}/chat/sessions`);
+          state.chatSessions = res.sessions || [];
+          renderChatSessionHeader();
+          renderHistoryList();
+        }
+        showToast("已删除该历史对话");
+      } catch (err) {
+        showToast(err.message);
+      }
+    });
+  });
+}
+
+async function refreshChatSessions() {
+  const res = await api(`/api/projects/${encodeURIComponent(state.projectId)}/chat/sessions`);
+  state.chatSessions = res.sessions || [];
+  renderChatSessionHeader();
+  renderHistoryList();
+}
+
+async function startNewBlankChat() {
+  if ($("#chat-history-popover")) {
+    $("#chat-history-popover").classList.add("hidden");
+    $("#btn-toggle-history").setAttribute("aria-expanded", "false");
+  }
+  const alreadyBlank = !state.chatMessages.length && !state.activeSessionId;
+  state.activeSessionId = null;
+  state.chatMessages = [];
+  state.activeCitations = [];
+  renderChatSessionHeader();
+  renderHistoryList();
+  renderChatFeed();
+  renderCitationTabs();
+  if (state.docsData.documents.length) {
+    await openDocInQaPreview(state.docsData.documents[0].id);
+  } else {
+    renderEmptyQaPreview();
+  }
+  $("#qa-input").focus();
+  if (!alreadyBlank) {
+    showToast("已开启新对话，旧对话已保存在「历史对话」中");
+  }
+}
+
+async function loadChatHistory(sessionId = null) {
+  const qs = sessionId ? `?session_id=${encodeURIComponent(sessionId)}` : "";
+  const data = await api(`/api/projects/${encodeURIComponent(state.projectId)}/chat/history${qs}`);
+  state.chatSessions = data.sessions || [];
+  state.activeSessionId = data.session_id || null;
   state.chatMessages = data.messages || [];
+  renderChatSessionHeader();
+  renderHistoryList();
   renderChatFeed();
   const lastTurn = state.chatMessages[state.chatMessages.length - 1];
   if (lastTurn && lastTurn.payload && lastTurn.payload.citations && lastTurn.payload.citations.length) {
@@ -797,12 +943,14 @@ async function handleSendQuestion() {
     const data = await api(`/api/projects/${encodeURIComponent(state.projectId)}/ask`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ question: q, mode }),
+      body: JSON.stringify({ question: q, mode, session_id: state.activeSessionId }),
     });
+    state.activeSessionId = data.turn.session_id || data.session_id || state.activeSessionId;
     state.chatMessages.push(data.turn);
     renderChatFeed();
     setQaCitations(data.turn.payload?.citations || [], 0);
     setQaRightTab("preview");
+    await refreshChatSessions();
   } catch (err) {
     showToast(err.message);
   } finally {
@@ -1074,12 +1222,22 @@ function bindEvents() {
     });
   });
 
-  // Project switcher dropdown
+  // Project switcher & history popovers
   $("#project-trigger").addEventListener("click", (e) => {
     e.stopPropagation();
     $("#project-dropdown").classList.toggle("hidden");
+    if ($("#chat-history-popover")) {
+      $("#chat-history-popover").classList.add("hidden");
+      $("#btn-toggle-history").setAttribute("aria-expanded", "false");
+    }
   });
-  document.addEventListener("click", () => $("#project-dropdown").classList.add("hidden"));
+  document.addEventListener("click", () => {
+    $("#project-dropdown").classList.add("hidden");
+    if ($("#chat-history-popover")) {
+      $("#chat-history-popover").classList.add("hidden");
+      $("#btn-toggle-history").setAttribute("aria-expanded", "false");
+    }
+  });
   $("#project-dropdown").addEventListener("click", (e) => e.stopPropagation());
 
   // Modals open/close
@@ -1141,11 +1299,21 @@ function bindEvents() {
   $("#qa-input").addEventListener("keydown", (e) => {
     if (e.key === "Enter") handleSendQuestion();
   });
-  $("#btn-clear-chat").addEventListener("click", async () => {
-    await api(`/api/projects/${encodeURIComponent(state.projectId)}/chat/history`, { method: "DELETE" });
-    state.chatMessages = [];
-    renderChatFeed();
-    showToast("已清空当前对话");
+  $("#btn-new-chat").addEventListener("click", startNewBlankChat);
+  $("#btn-toggle-history").addEventListener("click", (e) => {
+    e.stopPropagation();
+    $("#project-dropdown").classList.add("hidden");
+    const pop = $("#chat-history-popover");
+    const nowHidden = pop.classList.toggle("hidden");
+    $("#btn-toggle-history").setAttribute("aria-expanded", String(!nowHidden));
+    if (!nowHidden) {
+      $("#chat-history-search").focus();
+    }
+  });
+  $("#chat-history-popover").addEventListener("click", (e) => e.stopPropagation());
+  $("#chat-history-search").addEventListener("input", (e) => {
+    state.historySearch = e.target.value;
+    renderHistoryList();
   });
   const renderQaPreviewAtIdx = () => {
     const ch = state.previewChunks[state.previewChunkIdx];

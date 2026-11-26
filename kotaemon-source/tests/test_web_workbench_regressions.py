@@ -365,6 +365,59 @@ class WorkbenchRegressions(unittest.TestCase):
         self.assertIn("IP54", "\n".join(c["content"] for c in parsed_img.chunks))
         self.assertIn("IP54", "\n".join(c["content"] for c in parsed_pdf.chunks))
 
+    def test_chat_sessions_migrate_legacy_and_isolate_history(self):
+        with TestClient(create_web_app(self.root)) as client, \
+             patch.object(ProjectStore, "_embed_safe", return_value=None):
+            client.post("/api/projects", json={"id": "sess-proj", "name": "Session Project"}).raise_for_status()
+            store = ProjectStore(self.root, "sess-proj")
+            with sqlite3.connect(store.db_path) as conn:
+                conn.execute("DROP TABLE chat_sessions")
+                conn.execute(
+                    "INSERT INTO chat_messages(id, role, question, time_str, payload_json, created_at) "
+                    "VALUES ('m-old', 'turn', 'Old legacy question', '10:00', ?, '2026-11-25 10:00')",
+                    (json.dumps({"conclusion": "Old answer", "citations": []}),),
+                )
+            conn.close()
+
+            base = "/api/projects/sess-proj"
+            client.post(
+                base + "/documents/upload",
+                files={"files": ("spec.txt", b"Cabinet protection IP54. Rated voltage 24 V DC.", "text/plain")},
+            ).raise_for_status()
+
+            hist0 = client.get(base + "/chat/history").raise_for_status().json()
+            self.assertEqual(len(hist0["sessions"]), 1)
+            s1_id = hist0["sessions"][0]["id"]
+            self.assertEqual(hist0["session_id"], s1_id)
+            self.assertEqual(hist0["messages"][0]["question"], "Old legacy question")
+
+            # Follow-up in Session 1 preserves title & increments message count
+            t1 = client.post(base + "/ask", json={"question": "Protection rating?", "session_id": s1_id}).raise_for_status().json()
+            self.assertEqual(t1["session_id"], s1_id)
+
+            # New blank chat creates an independent Session 2 without deleting Session 1
+            t2 = client.post(base + "/ask", json={"question": "Voltage rating?", "session_id": None}).raise_for_status().json()
+            s2_id = t2["session_id"]
+            self.assertNotEqual(s2_id, s1_id)
+
+            sessions = client.get(base + "/chat/sessions").raise_for_status().json()["sessions"]
+            self.assertEqual(len(sessions), 2)
+            self.assertEqual(sessions[0]["id"], s2_id)
+            self.assertEqual(sessions[1]["id"], s1_id)
+            self.assertEqual(sessions[1]["message_count"], 2)
+
+            h1 = client.get(f"{base}/chat/history?session_id={s1_id}").raise_for_status().json()
+            h2 = client.get(f"{base}/chat/history?session_id={s2_id}").raise_for_status().json()
+            self.assertEqual([m["question"] for m in h1["messages"]], ["Old legacy question", "Protection rating?"])
+            self.assertEqual([m["question"] for m in h2["messages"]], ["Voltage rating?"])
+
+            # Rename Session 1 & delete Session 2
+            renamed = client.patch(f"{base}/chat/sessions/{s1_id}", json={"title": "防护等级排查"}).raise_for_status().json()["session"]
+            self.assertEqual(renamed["title"], "防护等级排查")
+            client.delete(f"{base}/chat/sessions/{s2_id}").raise_for_status()
+            rem = client.get(base + "/chat/sessions").raise_for_status().json()["sessions"]
+            self.assertEqual([s["id"] for s in rem], [s1_id])
+
 
 if __name__ == "__main__":
     unittest.main()

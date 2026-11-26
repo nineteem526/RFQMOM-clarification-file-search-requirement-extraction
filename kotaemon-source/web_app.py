@@ -183,8 +183,15 @@ class ProjectStore:
                     embedding BLOB DEFAULT NULL,
                     FOREIGN KEY(doc_id) REFERENCES documents(id) ON DELETE CASCADE
                 );
+                CREATE TABLE IF NOT EXISTS chat_sessions (
+                    id TEXT PRIMARY KEY,
+                    title TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS chat_messages (
                     id TEXT PRIMARY KEY,
+                    session_id TEXT DEFAULT '',
                     role TEXT NOT NULL,
                     question TEXT DEFAULT '',
                     time_str TEXT NOT NULL,
@@ -224,6 +231,10 @@ class ProjectStore:
                 conn.execute("ALTER TABLE chunks ADD COLUMN embedding BLOB DEFAULT NULL")
             if "chunk_type" not in cols:
                 conn.execute("ALTER TABLE chunks ADD COLUMN chunk_type TEXT DEFAULT 'text'")
+            chat_cols = {row["name"] for row in conn.execute("PRAGMA table_info(chat_messages)")}
+            if "session_id" not in chat_cols:
+                conn.execute("ALTER TABLE chat_messages ADD COLUMN session_id TEXT DEFAULT ''")
+            self._adopt_orphan_messages(conn)
             doc_cols = {row["name"] for row in conn.execute("PRAGMA table_info(documents)")}
             if "parse_warnings" not in doc_cols:
                 conn.execute("ALTER TABLE documents ADD COLUMN parse_warnings TEXT DEFAULT '[]'")
@@ -526,25 +537,185 @@ class ProjectStore:
             "results": results,
         }
 
-    def get_chat_history(self) -> list[dict]:
+    @staticmethod
+    def _make_session_title(question: str) -> str:
+        clean = re.sub(r"\s+", " ", (question or "").strip())
+        if not clean:
+            return "新对话"
+        return clean if len(clean) <= 28 else clean[:28] + "…"
+
+    @classmethod
+    def _adopt_orphan_messages(cls, conn):
+        orphans = conn.execute(
+            "SELECT question, created_at FROM chat_messages "
+            "WHERE COALESCE(session_id, '') = '' ORDER BY rowid ASC"
+        ).fetchall()
+        if not orphans:
+            return
+        first_q = orphans[0]["question"] or "历史对话"
+        first_ts = orphans[0]["created_at"] or _now_str()
+        last_ts = orphans[-1]["created_at"] or first_ts
+        title = cls._make_session_title(first_q)
+        existing = conn.execute("SELECT id FROM chat_sessions WHERE id='sess-legacy'").fetchone()
+        if existing:
+            conn.execute("UPDATE chat_sessions SET updated_at=? WHERE id='sess-legacy'", (last_ts,))
+        else:
+            conn.execute(
+                "INSERT INTO chat_sessions(id, title, created_at, updated_at) VALUES (?, ?, ?, ?)",
+                ("sess-legacy", title, first_ts, last_ts),
+            )
+        conn.execute("UPDATE chat_messages SET session_id='sess-legacy' WHERE COALESCE(session_id, '') = ''")
+
+    @staticmethod
+    def _fetch_sessions(conn, session_id: str | None = None) -> list[dict]:
+        where = "WHERE s.id = ?" if session_id else ""
+        params = (session_id,) if session_id else ()
+        rows = conn.execute(
+            f"""
+            SELECT s.id, s.title, s.created_at, s.updated_at,
+                   COUNT(m.id) AS message_count,
+                   COALESCE((
+                       SELECT m2.question FROM chat_messages m2
+                       WHERE m2.session_id = s.id ORDER BY m2.rowid DESC LIMIT 1
+                   ), '') AS last_question
+            FROM chat_sessions s
+            LEFT JOIN chat_messages m ON m.session_id = s.id
+            {where}
+            GROUP BY s.id
+            ORDER BY s.updated_at DESC, COALESCE(MAX(m.rowid), 0) DESC, s.rowid DESC
+            """,
+            params,
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def list_chat_sessions(self) -> list[dict]:
         with self._conn() as conn:
-            rows = conn.execute("SELECT * FROM chat_messages ORDER BY rowid ASC").fetchall()
-            result = []
-            for r in rows:
-                result.append({
+            self._adopt_orphan_messages(conn)
+            return self._fetch_sessions(conn)
+
+    def create_chat_session(self, title: str = "新对话") -> dict:
+        sid = f"sess-{uuid.uuid4().hex[:10]}"
+        clean_title = re.sub(r"\s+", " ", (title or "").strip())[:60] or "新对话"
+        now = _now_str()
+        with self._conn() as conn:
+            conn.execute(
+                "INSERT INTO chat_sessions(id, title, created_at, updated_at) VALUES (?, ?, ?, ?)",
+                (sid, clean_title, now, now),
+            )
+            return self._fetch_sessions(conn, sid)[0]
+
+    def rename_chat_session(self, session_id: str, title: str) -> dict:
+        clean_title = re.sub(r"\s+", " ", (title or "").strip())[:60]
+        if not clean_title:
+            raise ValueError("对话标题不能为空")
+        with self._conn() as conn:
+            cur = conn.execute(
+                "UPDATE chat_sessions SET title=? WHERE id=?",
+                (clean_title, session_id),
+            )
+            if cur.rowcount == 0:
+                raise KeyError("未找到指定对话会话")
+            return self._fetch_sessions(conn, session_id)[0]
+
+    def delete_chat_session(self, session_id: str) -> bool:
+        with self._conn() as conn:
+            conn.execute("DELETE FROM chat_messages WHERE session_id=?", (session_id,))
+            cur = conn.execute("DELETE FROM chat_sessions WHERE id=?", (session_id,))
+            if cur.rowcount == 0:
+                raise KeyError("未找到指定对话会话")
+        return True
+
+    def get_chat_history(self, session_id: str | None = None) -> list[dict]:
+        with self._conn() as conn:
+            self._adopt_orphan_messages(conn)
+            target_sid = (session_id or "").strip()
+            if not target_sid:
+                row = conn.execute(
+                    """
+                    SELECT s.id FROM chat_sessions s
+                    LEFT JOIN chat_messages m ON m.session_id = s.id
+                    GROUP BY s.id
+                    ORDER BY s.updated_at DESC, COALESCE(MAX(m.rowid), 0) DESC, s.rowid DESC
+                    LIMIT 1
+                    """
+                ).fetchone()
+                if not row:
+                    return []
+                target_sid = row["id"]
+            rows = conn.execute(
+                "SELECT * FROM chat_messages WHERE session_id=? ORDER BY rowid ASC",
+                (target_sid,),
+            ).fetchall()
+            return [
+                {
                     "id": r["id"],
+                    "session_id": r["session_id"],
                     "role": r["role"],
                     "question": r["question"],
                     "time": r["time_str"],
                     "payload": json.loads(r["payload_json"]),
-                })
-            return result
+                }
+                for r in rows
+            ]
 
-    def clear_chat(self):
+    def clear_chat(self, session_id: str | None = None):
         with self._conn() as conn:
-            conn.execute("DELETE FROM chat_messages")
+            if session_id:
+                conn.execute("DELETE FROM chat_messages WHERE session_id=?", (session_id,))
+                conn.execute("DELETE FROM chat_sessions WHERE id=?", (session_id,))
+            else:
+                conn.execute("DELETE FROM chat_messages")
+                conn.execute("DELETE FROM chat_sessions")
 
-    def ask_question(self, question: str, mode: str = "快速问答") -> dict:
+    def _record_chat_turn(
+        self,
+        conn,
+        session_id: str | None,
+        question: str,
+        now_time: str,
+        now_full: str,
+        answer_payload: dict,
+    ) -> tuple[str, str, str]:
+        req_sid = (session_id or "").strip()
+        if req_sid:
+            existing = conn.execute(
+                "SELECT id, title FROM chat_sessions WHERE id=?",
+                (req_sid,),
+            ).fetchone()
+            if existing:
+                active_sid = req_sid
+                active_title = (
+                    self._make_session_title(question)
+                    if existing["title"] == "新对话"
+                    else existing["title"]
+                )
+                conn.execute(
+                    "UPDATE chat_sessions SET title=?, updated_at=? WHERE id=?",
+                    (active_title, now_full, active_sid),
+                )
+            else:
+                active_sid = req_sid
+                active_title = self._make_session_title(question)
+                conn.execute(
+                    "INSERT INTO chat_sessions(id, title, created_at, updated_at) VALUES (?, ?, ?, ?)",
+                    (active_sid, active_title, now_full, now_full),
+                )
+        else:
+            active_sid = f"sess-{uuid.uuid4().hex[:10]}"
+            active_title = self._make_session_title(question)
+            conn.execute(
+                "INSERT INTO chat_sessions(id, title, created_at, updated_at) VALUES (?, ?, ?, ?)",
+                (active_sid, active_title, now_full, now_full),
+            )
+        msg_id = uuid.uuid4().hex[:12]
+        conn.execute(
+            "INSERT INTO chat_messages(id, session_id, role, question, time_str, payload_json, created_at) "
+            "VALUES (?, ?, 'turn', ?, ?, ?, ?)",
+            (msg_id, active_sid, question, now_time, json.dumps(answer_payload, ensure_ascii=False), now_full),
+        )
+        return msg_id, active_sid, active_title
+
+    def ask_question(self, question: str, mode: str = "快速问答", session_id: str | None = None) -> dict:
         q = question.strip()
         if not q:
             raise ValueError("请输入要查询的问题")
@@ -580,13 +751,19 @@ class ProjectStore:
             answer_payload = json.loads(cached_row["payload_json"])
             answer_payload["cached"] = True
             answer_payload["cached_from"] = cached_row["created_at"]
-            msg_id = uuid.uuid4().hex[:12]
             with self._conn() as conn:
-                conn.execute(
-                    "INSERT INTO chat_messages(id, role, question, time_str, payload_json, created_at) VALUES (?, 'turn', ?, ?, ?, ?)",
-                    (msg_id, q, now_time, json.dumps(answer_payload, ensure_ascii=False), now_full),
+                msg_id, active_sid, active_title = self._record_chat_turn(
+                    conn, session_id, q, now_time, now_full, answer_payload
                 )
-            return {"id": msg_id, "role": "turn", "question": q, "time": now_time, "payload": answer_payload}
+            return {
+                "id": msg_id,
+                "session_id": active_sid,
+                "session_title": active_title,
+                "role": "turn",
+                "question": q,
+                "time": now_time,
+                "payload": answer_payload,
+            }
 
         with self._conn() as conn:
             rows = conn.execute(
@@ -629,7 +806,6 @@ class ProjectStore:
 
         now_time = datetime.now().strftime("%H:%M")
         now_full = _now_str()
-        msg_id = uuid.uuid4().hex[:12]
         with self._conn() as conn:
             current_revision = conn.execute("SELECT value FROM settings WHERE key='_revision'").fetchone()[0]
             if int(current_revision) == rev and (
@@ -639,12 +815,13 @@ class ProjectStore:
                     "INSERT OR REPLACE INTO query_cache(cache_key, revision, payload_json, created_at) VALUES (?, ?, ?, ?)",
                     (cache_sig, rev, json.dumps(answer_payload, ensure_ascii=False), now_full),
                 )
-            conn.execute(
-                "INSERT INTO chat_messages(id, role, question, time_str, payload_json, created_at) VALUES (?, 'turn', ?, ?, ?, ?)",
-                (msg_id, q, now_time, json.dumps(answer_payload, ensure_ascii=False), now_full),
+            msg_id, active_sid, active_title = self._record_chat_turn(
+                conn, session_id, q, now_time, now_full, answer_payload
             )
         return {
             "id": msg_id,
+            "session_id": active_sid,
+            "session_title": active_title,
             "role": "turn",
             "question": q,
             "time": now_time,
@@ -986,6 +1163,7 @@ def seed_demo_project(runtime_root: Path):
             "INSERT OR IGNORE INTO chat_messages(id, role, question, time_str, payload_json, created_at) VALUES (?, 'turn', ?, '14:26', ?, '2024-11-20 14:26')",
             ("msg-demo-1", "电控柜的防护等级要求是什么？", json.dumps(demo_answer, ensure_ascii=False)),
         )
+        store._adopt_orphan_messages(conn)
 
         saved_seed = [
             (
@@ -1207,15 +1385,52 @@ def create_web_app(runtime_root: Path | None = None) -> FastAPI:
             f"<pre style='white-space:pre-wrap;background:#f8fafc;padding:20px;border-radius:10px;border:1px solid #e5e7eb'>{escape(text)}</pre></body></html>"
         )
 
-    @api.get("/api/projects/{project_id}/chat/history")
-    def chat_history(project_id: str):
+    @api.get("/api/projects/{project_id}/chat/sessions")
+    def list_chat_sessions(project_id: str):
         store = get_store(project_id)
-        return {"messages": store.get_chat_history()}
+        return {"sessions": store.list_chat_sessions()}
+
+    @api.post("/api/projects/{project_id}/chat/sessions")
+    def create_chat_session(project_id: str, payload: dict | None = None):
+        store = get_store(project_id)
+        title = str((payload or {}).get("title", "新对话"))
+        return {"session": store.create_chat_session(title)}
+
+    @api.patch("/api/projects/{project_id}/chat/sessions/{session_id}")
+    def rename_chat_session(project_id: str, session_id: str, payload: dict):
+        store = get_store(project_id)
+        try:
+            return {"session": store.rename_chat_session(session_id, str(payload.get("title", "")))}
+        except KeyError as err:
+            raise HTTPException(404, str(err)) from None
+        except ValueError as err:
+            raise HTTPException(400, str(err)) from None
+
+    @api.delete("/api/projects/{project_id}/chat/sessions/{session_id}")
+    def delete_chat_session(project_id: str, session_id: str):
+        store = get_store(project_id)
+        try:
+            store.delete_chat_session(session_id)
+            return {"ok": True}
+        except KeyError as err:
+            raise HTTPException(404, str(err)) from None
+
+    @api.get("/api/projects/{project_id}/chat/history")
+    def chat_history(project_id: str, session_id: str | None = None):
+        store = get_store(project_id)
+        sessions = store.list_chat_sessions()
+        active_sid = (
+            session_id
+            if (session_id and any(s["id"] == session_id for s in sessions))
+            else (sessions[0]["id"] if sessions else None)
+        )
+        messages = store.get_chat_history(active_sid) if active_sid else []
+        return {"session_id": active_sid, "sessions": sessions, "messages": messages}
 
     @api.delete("/api/projects/{project_id}/chat/history")
-    def clear_chat_history(project_id: str):
+    def clear_chat_history(project_id: str, session_id: str | None = None):
         store = get_store(project_id)
-        store.clear_chat()
+        store.clear_chat(session_id=session_id)
         return {"ok": True}
 
     @api.post("/api/projects/{project_id}/ask")
@@ -1225,8 +1440,9 @@ def create_web_app(runtime_root: Path | None = None) -> FastAPI:
             turn = store.ask_question(
                 str(payload.get("question", "")),
                 mode=str(payload.get("mode", "快速问答")),
+                session_id=payload.get("session_id"),
             )
-            return {"turn": turn}
+            return {"turn": turn, "session_id": turn["session_id"]}
         except ValueError as err:
             raise HTTPException(400, str(err)) from None
 
