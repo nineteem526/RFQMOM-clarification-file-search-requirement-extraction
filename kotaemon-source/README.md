@@ -2,26 +2,36 @@
 
 ## 本机多项目工作台
 
-### 硅基流动 DeepSeek 个人测试
+### 本阶段核心能力与架构（截至 2026-11-26）
 
-PowerShell 7 中设置以下进程环境变量，模型名以硅基流动平台当前显示的完整名称为准。密钥仅在本终端进程及其子进程中使用，不要写入仓库或发送到聊天中。
+- **极简双栏与双层角色工作台**（`web_app.py`、`web_ui/`）：
+  - 保留「问答」「资料」「已保存」「设置」四栏架构；「问答」与「资料」采用可自由拖拽调整宽度的双栏布局，问答页右侧支持「原文预览 / 项目资料」切换与多文件夹平滑折叠动画。
+  - 精简问答输出，直接给出结论与可点击「原文出处」定位胶囊，支持点击切换 PDF/图片原页图像预览。
+  - **普通用户 / 管理员权限隔离**：管理员通过本机口令解锁（`local_llm_config.json` 加盐哈希校验，`PUT /api/llm-config` 未授权返回 403），配置一次服务商（硅基流动 SiliconFlow / 企业 Azure / 仅本地）、模型 ID 与密钥后永久保存在 `%LOCALAPPDATA%\RFQKotaemon\local_llm_config.json`（网页仅掩码回显，不写入 Git）；新老项目默认启用后普通用户即可开箱即用。
+- **多模态分型解析与切片**（`document_chunker.py`、`local_ocr.py`、`environment-setup/install-ocr.ps1`）：
+  - **PDF**：跨页重复页眉/页脚抑制 + 条款/中英文章节边界切片；原生表格整行打包、跨块重复表头，正文自动去重表内文字。
+  - **扫描页与独立图片**：通过 `%LOCALAPPDATA%\RFQKotaemon\ocr\.venv` 离线 `rapidocr-onnxruntime==1.4.4`（模型 SHA-256 校验、禁止子进程联网）支持纯扫描页、含少量页码的图文页、大图插图区域及独立图片（PNG/JPG/BMP/WEBP/多帧 TIFF）按坐标聚类分栏识别。
+  - **Office 与网页**：Word `.docx`/`.docm`（含文本框与宏启用 OOXML）、Excel `.xlsx`/`.xlsm`（表头检测与合并单元格传播）、HTML、CSV 及旧版 `.doc`/`.xls`/`.wps`（魔数识别或临时快照转换），并在「资料」页提供切块分类统计、翻页与一键批量重解析接口（`POST /api/projects/{id}/documents/reparse-all`）。
+- **确定性证据校验与容错自纠正**（`rag_engine.py`、`eval_e2e_rag.py`）：
+  - 严格校验数字/单位/型号、引用越界、待批准与已批准状态边界；支持表格“数值/单位分列组合”识别与明确拒答句中复述提问数字豁免，同时对肯定结论维持零容忍防幻觉拦截。
+  - 分类上报模型调用失败原因（`auth_error`/`rate_limit`/`model_not_found`/`timeout`/`truncated` 等），校验未通过时自动携带反馈最多自纠正 1 次，仍不通过或调用失败时安全回退本地原文摘录；提供 `--mode mock / live` 端到端评测脚本。
+
+### 启动与硅基流动测试
+
+按需通过环境变量或在前端「设置 → 管理员登录」完成永久配置。若在当前终端临时覆盖环境变量：
 
     $env:RFQ_LLM_PROVIDER = "siliconflow"
     $env:SILICONFLOW_MODEL = "填写平台提供的 DeepSeek 模型完整名称"
     $env:SILICONFLOW_API_KEY = Read-Host "输入硅基流动 API Key" -MaskInput
-    & "$env:LOCALAPPDATA\RFQKotaemon\runtime\.venv\Scripts\python.exe" -B .\web_app.py --port 7867
+    & "$env:LOCALAPPDATA\RFQKotaemon\runtime\.venv\Scripts\python.exe" -B .\web_app.py --port 7868
 
-打开测试项目的设置并启用“在线模型问答”。当前问题和最多五条检索片段将发往硅基流动，先使用公开测试手册。设置显示“已配置”只代表参数就绪，实际连通性须用测试问题验证。若调用失败或答案未通过引文校验，页面会提示并显示本地原文摘录。关闭终端后环境变量不会保留。
-
-在本文所述的专用 Python 环境准备完成后，从此目录运行：
+在专用 Python 环境准备完成后，常规启动默认监听本机回环地址（默认端口 7866，可用 `--port` 指定）：
 
     & "$env:LOCALAPPDATA\RFQKotaemon\runtime\.venv\Scripts\python.exe" -B .\web_app.py --port 7866
 
-工作台默认监听本机回环地址。新项目默认使用本地检索和原文摘录。资料获准发送给企业模型后，先按下文配置已批准的企业端点，再在该项目的设置中启用“企业模型问答”。工作台使用已有的企业 Azure 适配器。
+> 如需运行本地离线 OCR，先执行 `.\environment-setup\install-ocr.ps1` 创建隔离的 `%LOCALAPPDATA%\RFQKotaemon\ocr\.venv`。工作台按项目隔离存储于 `%LOCALAPPDATA%\RFQKotaemon\projects\<project_id>\`；未明确启用在线模型问答且配置就绪时仅执行本地检索与原文摘录。旧库升级后被标为“待重新解析”的文件，可在「资料」页点击“一键重解析待更新”批量恢复索引。
 
-旧工作台数据库首次打开时，旧版入库的 PDF、Excel 和曾以失败占位文字入库的文件会标记为“待重新解析”。到资料页重新解析这些文件以恢复检索，原件保留在已有项目中。答复只使用候选检索结果中的证据，界面会显示实际证据条数和检查范围。
-
-Makita 和中文 RFQ 本地检索评测可运行 `python -B eval_benchmark.py --data-root "<评测资料上一级目录>" --include-cases`。Makita 的片段命中要求单条候选包含完整参考原文。
+Makita 和中文 RFQ 检索与端到端评测可运行 `python -B eval_benchmark.py --data-root "<评测资料上一级目录>"` 或 `python -B eval_e2e_rag.py --mode mock --dataset both`（`--mode live` 使用已配置的在线模型）。
 
 Source snapshot prepared on 2026-10-29 from the locally maintained application.
 The sibling `kotaemon-pilot` remains the existing local installation and is not
